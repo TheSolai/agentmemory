@@ -381,11 +381,17 @@ describe("OpenClaw profile and credential isolation", () => {
   it("retains pending session starts across cache eviction", async () => {
     const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
     const api = makeApi();
+    vi.stubEnv("AGENTMEMORY_PROJECT_NAME", "eviction-test");
+    vi.stubEnv("AGENTMEMORY_SECRET", "synthetic-token");
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Set<string>();
     const observed = new Set<string>();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-      if (String(url).endsWith("session/start")) await held;
+      if (String(url).endsWith("session/start")) {
+        started.add(JSON.parse(String(init?.body)).sessionId);
+        await held;
+      }
       if (String(url).endsWith("observe")) observed.add(JSON.parse(String(init?.body)).sessionId);
       return successfulResponse(url, init);
     });
@@ -395,9 +401,10 @@ describe("OpenClaw profile and credential isolation", () => {
       const tasks = Array.from({ length: 257 }, (_, i) => capture({ success: true, messages: [
         { role: "user", content: "request" }, { role: "assistant", content: "answer" },
       ] }, { sessionId: `session-${i}`, workspaceDir: "/workspace", agentId: "main" }));
+      expect(started.size).toBe(257);
       expect(observed.size).toBe(0);
       release(); await Promise.all(tasks);
-      expect(observed.size).toBe(257);
-    } finally { release(); fetchMock.mockRestore(); }
+      expect(observed).toEqual(started);
+    } finally { release(); fetchMock.mockRestore(); vi.unstubAllEnvs(); }
   });
 });

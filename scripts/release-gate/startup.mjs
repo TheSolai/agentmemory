@@ -64,9 +64,10 @@ function launch(command, args, env, cwd, logFile) {
   const child = spawn(command, args, { env, cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   children.add(child);
   child.text = "";
+  child.stdoutText = "";
   child.result = null;
   const record = (chunk) => { child.text += chunk; if (logFile) appendFileSync(logFile, chunk); };
-  child.stdout.on("data", record);
+  child.stdout.on("data", (chunk) => { child.stdoutText += chunk; record(chunk); });
   child.stderr.on("data", record);
   child.on("error", (err) => record(String(err)));
   child.on("close", (code, signal) => { child.result = { code, signal }; children.delete(child); });
@@ -78,11 +79,11 @@ async function exited(child, timeoutMs = 30_000) {
   if (!child.result) { kill(child.pid); throw new Error(`process exceeded ${timeoutMs}ms: ${child.text.slice(-1000)}`); }
   return child.result;
 }
-async function command(bin, args, env = process.env, cwd = repo, timeout = 120_000, logFile) {
+async function command(bin, args, env = process.env, cwd = repo, timeout = 120_000, logFile, output = "combined") {
   const child = launch(bin, args, env, cwd, logFile);
   const result = await exited(child, timeout);
   assert.equal(result.code, 0, `${bin} ${args.join(" ")}: ${child.text.slice(-1200)}`);
-  return child.text;
+  return output === "stdout" ? child.stdoutText : child.text;
 }
 async function poll(label, probe, timeoutMs = 90_000) {
   const deadline = Date.now() + timeoutMs;
@@ -125,7 +126,7 @@ async function install() {
   if (!tarball) {
     if (!options.skipBuild) await command("npm", ["run", "build"], process.env, repo, 600_000, join(out, "build.log"));
     const packDir = join(root, "pack"); mkdirSync(packDir);
-    const packed = await command("npm", ["pack", "--json", "--pack-destination", packDir]);
+    const packed = await command("npm", ["pack", "--json", "--pack-destination", packDir], process.env, repo, 120_000, join(out, "pack.log"), "stdout");
     tarball = join(packDir, JSON.parse(packed)[0].filename);
   }
   artifactSha = sha(tarball);
