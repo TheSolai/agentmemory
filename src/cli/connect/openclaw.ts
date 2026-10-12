@@ -88,7 +88,7 @@ export const adapter: ConnectAdapter = {
                 (key === "AGENTMEMORY_SECRET" && value === "${AGENTMEMORY_SECRET:-}")) delete env[key];
             if (key === "AGENTMEMORY_TOOLS" && value === "${AGENTMEMORY_TOOLS:-all}") env[key] = "all";
           }
-          servers.agentmemory = { ...runtime, ...migrated, transport: "stdio", env };
+          servers.agentmemory = { ...migrated, ...runtime, transport: "stdio", env };
         } else p.log.info("Preserved the existing AgentMemory MCP entry. After moving the installed package, review its settings and reconnect with --with-mcp --force to refresh its runtime path.");
         if (migrateLegacy) delete next.mcpServers;
         next.mcp = { ...mcp, servers };

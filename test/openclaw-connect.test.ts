@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 describe("OpenClaw connector", () => {
   let home: string;
@@ -35,8 +36,8 @@ describe("OpenClaw connector", () => {
     expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("already-wired");
     expect(readFileSync(path, "utf8")).toBe(text);
   });
-  it("migrates the old AgentMemory block and preserves custom values", async () => {
-    const legacy = { command: "npx", args: ["-y", "@agentmemory/mcp"], env: { AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}", AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}", CUSTOM: "preserved" } };
+  it.each([["-y", "@agentmemory/mcp"], ["@agentmemory/mcp"]])("migrates the old AgentMemory launcher %j and preserves custom values", async (...args) => {
+    const legacy = { command: "npx", args, timeout: 45000, env: { AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}", AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}", CUSTOM: "preserved" } };
     writeFileSync(path, JSON.stringify({ mcpServers: { agentmemory: legacy }, agents: { defaults: {} } }));
     const { adapter } = await import("../src/cli/connect/openclaw.js");
     expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
@@ -44,6 +45,9 @@ describe("OpenClaw connector", () => {
     expect(config.mcpServers).toBeUndefined();
     expect(config.mcp.servers.agentmemory.env).toEqual({ CUSTOM: "preserved", AGENTMEMORY_TOOLS: "all", AGENTMEMORY_FORCE_PROXY: "1" });
     expect(config.mcp.servers.agentmemory.transport).toBe("stdio");
+    expect(config.mcp.servers.agentmemory.command).toBe(process.execPath);
+    expect(config.mcp.servers.agentmemory.args).toEqual([fileURLToPath(new URL("../dist/standalone.mjs", import.meta.url))]);
+    expect(config.mcp.servers.agentmemory.timeout).toBe(45000);
   });
   it("preserves an explicit legacy proxy override during migration", async () => {
     writeFileSync(path, JSON.stringify({ mcpServers: { agentmemory: { command: "npx", args: ["@agentmemory/mcp"], env: { AGENTMEMORY_FORCE_PROXY: "0" } } } }));
@@ -86,6 +90,26 @@ describe("OpenClaw connector", () => {
   });
   it("leaves mixed legacy registries untouched and explains why native validation needs migration", async () => {
     const raw = JSON.stringify({ mcpServers: { agentmemory: { command: "npx", args: ["@agentmemory/mcp"] }, custom: { command: "custom" } } });
+    writeFileSync(path, raw);
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("skipped");
+    expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+  it("preserves a customized current MCP server when removing its recognized legacy duplicate", async () => {
+    const current = { command: "custom-launcher", args: ["--custom"], env: { CUSTOM: "keep" } };
+    const other = { command: "another-server" };
+    writeFileSync(path, JSON.stringify({
+      mcpServers: { agentmemory: { command: "npx", args: ["-y", "@agentmemory/mcp"] } },
+      mcp: { servers: { agentmemory: current, other } },
+    }));
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    const config = JSON.parse(readFileSync(path, "utf8"));
+    expect(config.mcpServers).toBeUndefined();
+    expect(config.mcp.servers).toEqual({ agentmemory: current, other });
+  });
+  it("does not rewrite an unrecognized custom legacy launcher", async () => {
+    const raw = JSON.stringify({ mcpServers: { agentmemory: { command: "custom-launcher", args: ["@agentmemory/mcp"] } } });
     writeFileSync(path, raw);
     const { adapter } = await import("../src/cli/connect/openclaw.js");
     expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("skipped");
