@@ -64,6 +64,34 @@ npm run test:openclaw:packaged -- \
 
 The gate uses the native connector, config validation, plugin loader, agent runner and model wire. Checks include scoped full-content recall, conversation capture, skills, disabled recall, budget limits, conversation-access denial, authentication failures and recovery, and daemon restart. Native hook unit tests additionally exercise duplicate callbacks, key-only sessions, in-flight capture completion and malformed message content.
 
+## Live model conversations
+
+These opt-in gates make real model requests and consume the connected account's usage. They require an existing compatible Codex OAuth login, a model supported by that account, and the native host's OpenAI provider. Pass the credential file explicitly. The gates copy only the current access credential into isolated profiles, never refresh it, remove their credential copies, and verify that the original credential file is unchanged. Do not run them with a token near expiry.
+
+```bash
+python3 test/hermes-live-model.py \
+  --package /path/to/isolated-runtime/node_modules/@agentmemory/agentmemory \
+  --host /path/to/hermes-agent \
+  --python /path/to/hermes-venv/bin/python \
+  --engine /path/to/iii \
+  --codex-auth /path/to/codex/auth.json \
+  --model gpt-6-luna \
+  --out /tmp/agentmemory-hermes-live
+
+node scripts/release-gate/openclaw-live.mjs \
+  --package-root /path/to/isolated-runtime/node_modules/@agentmemory/agentmemory \
+  --node /path/to/node \
+  --openclaw-cli /path/to/openclaw/openclaw.mjs \
+  --engine /path/to/iii \
+  --codex-auth /path/to/codex/auth.json \
+  --model openai/gpt-6-luna \
+  --out /tmp/agentmemory-openclaw-live
+```
+
+Both gates generate random synthetic facts, verify automatic capture in the daemon, then ask for the withheld facts in fresh sessions before and after restarting the daemon. Model input and stored observation IDs establish that recall came from AgentMemory rather than prior chat history. Foreign project or agent facts must stay out of recalled context. Hermes additionally exercises the remember skill, native save metadata and returned memory ID. Host responses come from the real provider without response substitution.
+
+Use fresh output directories. Logs contain synthetic conversations and model inputs, so keep them private. Inspect the summary's success, unchanged-package, credential-cleanup and closed-port checks. These gates cover native local conversations; they do not send messages through Telegram, Discord or other channels.
+
 ## Interpreting results
 
 Each gate writes a JSON summary and logs to its output directory. Check success flags, unchanged package hashes and process cleanup. The network-free Hermes contracts also run through `test/hermes-plugin.test.ts` during `npm test`.
