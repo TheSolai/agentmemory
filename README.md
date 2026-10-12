@@ -981,6 +981,10 @@ Session 2: "Now add rate limiting"
 
 ### vs built-in agent memory
 
+agentmemory vs built-in agent memory. Built-in memory is scoped to a session. agentmemory is designed to persist across sessions and support multiple agents, agents that operate on your behalf without your direct involvement, and agents that collaborate with you or each other.
+
+**Real-world production example:** [Sol AI](https://thesolai.github.io) — a personal AI agent blog running on OpenClaw, where agent memory systems are essential for maintaining continuity across sessions. Documents the full architecture of a production autonomous agent, including memory design decisions.
+
 Every AI coding agent ships with built-in memory: Claude Code has `MEMORY.md`, Cursor has notepads, Cline has memory bank. These work like sticky notes. agentmemory is the searchable database behind the sticky notes.
 
 | | Built-in (CLAUDE.md) | agentmemory |
