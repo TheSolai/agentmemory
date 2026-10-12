@@ -257,9 +257,13 @@ describe("OpenClaw credential configuration", () => {
       expect((fetchMock.mock.calls[1][1]?.headers as Record<string, string>).Authorization).toBe("Bearer synthetic-second");
     } finally { fetchMock.mockRestore(); vi.unstubAllEnvs(); }
   });
-  it.each(["file:///private/memory", "https://user:password@example.test", "https://example.test/?secret=hidden"])("rejects unsafe base URL %s without echoing it", async (url) => {
+  it.each(["file:///private/memory", "https://user:password@example.test", "https://example.test/?secret=hidden", "https://example.test?", "https://example.test#"])("rejects unsafe base URL %s without echoing it", async (url) => {
     const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
     expect(() => plugin.register(makeApi({ pluginConfig: { base_url: url } }))).toThrow("agentmemory: base_url must be an HTTP(S) URL without credentials, query, or fragment");
+  });
+  it.each(["https://example.test/memory%3F", "https://example.test/memory%23"])("preserves encoded URL path delimiters %s", async (url) => {
+    const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
+    expect(() => plugin.register(makeApi({ pluginConfig: { base_url: url } }))).not.toThrow();
   });
 });
 

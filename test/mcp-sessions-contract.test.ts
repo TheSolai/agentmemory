@@ -77,6 +77,18 @@ describe("session tools across transports", () => {
     expect(second.nextCursor).toBeNull();
   });
 
+  it.each(["", "  "])("treats a blank continuation cursor as the first page on every transport: %j", async (cursor) => {
+    const { kv, call, handlers, headers } = setup();
+    await kv.set("mem:sessions", "first", { id: "first", project: "app", startedAt: "2026-01-01" });
+    const rest = await handlers.get("api::sessions")!({ headers, query_params: { project: "app", limit: "20", cursor } });
+    const mcp = await call({ project: "app", cursor });
+    expect(mcp.status_code).toBe(200);
+    expect(readPage(mcp)).toEqual(rest.body);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline fixture")));
+    const local = JSON.parse((await handleToolCall("memory_sessions", { project: "app", cursor }, kv)).content[0].text);
+    expect(local).toEqual(rest.body);
+  });
+
   it("does not disguise a daemon auth failure as empty local session history", async () => {
     const { kv } = setup();
     vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/livez")

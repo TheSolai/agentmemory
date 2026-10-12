@@ -14,7 +14,8 @@ memory_sessions { "project": "<current-project-id>", "limit": 20 }
 ```
 
 Pick the most recent session whose `cwd` matches this project, then:
-`memory_recall { "query": "<session top concepts>", "limit": 10 }`.
+`memory_recall { "query": "<session top concepts>", "project": "<current-project-id>", "limit": 10 }`.
+When an agent is requested, pass the same `agentId` to both calls.
 
 Expected output:
 

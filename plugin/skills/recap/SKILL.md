@@ -13,7 +13,8 @@ The user wants a recap. Time window args: $ARGUMENTS
 memory_sessions { "project": "<current-project-id>", "limit": 30 }
 ```
 
-Then per surviving session: `memory_recall { "query": "<top concepts>", "limit": 3 }`.
+Then per surviving session: `memory_recall { "query": "<top concepts>", "project": "<current-project-id>", "limit": 3 }`.
+When an agent is requested, pass the same `agentId` to both calls.
 
 Expected output:
 

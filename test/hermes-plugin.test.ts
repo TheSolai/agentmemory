@@ -70,6 +70,9 @@ describe("Hermes plugin manifest", () => {
       timeout: 20_000,
       env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: "1" },
     });
-    expect(result.status, result.stderr || result.stdout).toBe(0);
-  });
+    const diagnostics = [result.error?.message, result.signal, result.stderr, result.stdout]
+      .filter(Boolean)
+      .join("\n");
+    expect(result.status, diagnostics).toBe(0);
+  }, 30_000);
 });

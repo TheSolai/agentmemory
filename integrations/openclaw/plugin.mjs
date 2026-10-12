@@ -197,7 +197,7 @@ function createClient(cfg, api) {
   const baseUrl = String(cfg.base_url || DEFAULT_BASE_URL).replace(/\/+$/, "");
   let parsed;
   try { parsed = new URL(baseUrl); } catch {}
-  if (!parsed || !["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+  if (!parsed || !["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || /[?#]/.test(baseUrl)) {
     throw new Error("agentmemory: base_url must be an HTTP(S) URL without credentials, query, or fragment");
   }
   const timeoutMs = Number(cfg.timeout_ms || DEFAULT_TIMEOUT_MS);

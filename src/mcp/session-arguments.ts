@@ -8,6 +8,7 @@ export function parseSessionArguments(args: Record<string, unknown>): Record<str
   const query: Record<string, string> = { limit: String(Math.min(limit, 100)) };
   for (const field of ["project", "agentId", "cursor"] as const) {
     if (args[field] === undefined) continue;
+    if (field === "cursor" && typeof args[field] === "string" && !args[field].trim()) continue;
     if (typeof args[field] !== "string" || !args[field].trim()) {
       throw new Error(`${field} must be a non-empty string`);
     }

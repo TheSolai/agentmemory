@@ -137,7 +137,7 @@ def _is_loopback(base: str) -> bool:
 
 
 def _validate_url(base: str) -> bool:
-    if not isinstance(base, str) or not base or any(char.isspace() for char in base):
+    if not isinstance(base, str) or not base or any(char.isspace() for char in base) or "?" in base or "#" in base:
         return False
     try:
         parsed = urlparse(base)

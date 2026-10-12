@@ -94,6 +94,16 @@ class ProviderContract(unittest.TestCase):
         self.assertEqual(module._configuration(), ('https://remote.invalid', ''))
         self.assertNotIn('AGENTMEMORY_URL', os.environ)
 
+    def test_url_delimiters_fail_closed_without_rejecting_encoded_paths(self):
+        module = self.load()
+        module.urlopen = lambda *a, **k: self.fail('invalid endpoint reached the network')
+        for suffix in ['?', '#', '?query', '#fragment']:
+            endpoint = 'http://localhost:3111/base' + suffix
+            self.assertFalse(module._validate_url(endpoint), endpoint)
+            self.assertEqual(module._api(endpoint, 'search')['errorCode'], 'invalid_url')
+        for suffix in ['%3F', '%23']:
+            self.assertTrue(module._validate_url('http://localhost:3111/base' + suffix))
+
     def test_plaintext_guard_uses_same_numeric_loopback_boundary(self):
         module = self.load()
         os.environ['AGENTMEMORY_REQUIRE_HTTPS'] = '1'

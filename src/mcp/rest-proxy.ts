@@ -43,7 +43,7 @@ export type Handle = ProxyHandle | LocalHandle;
 let cached: Handle | null = null;
 let cachedUrl: string | null = null;
 let cachedAt = 0;
-let probeInFlight: Promise<Handle> | null = null;
+let probeInFlight: { url: string; forceProxy: boolean; promise: Promise<Handle> } | null = null;
 
 // `${VAR}`-style placeholders ship in plugin/.mcp.json so MCP hosts that
 // expand them (Claude Code, Cursor) substitute the user's shell value.
@@ -64,7 +64,7 @@ function baseUrl(): string {
   try {
     const parsed = new URL(value);
     if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname ||
-        parsed.username || parsed.password || parsed.search || parsed.hash || /\s/.test(value)) {
+        parsed.username || parsed.password || /[?#\s]/.test(value)) {
       throw new Error();
     }
     return value.replace(/\/+$/, "");
@@ -142,10 +142,11 @@ export async function resolveHandle(): Promise<Handle> {
       return cached;
     }
   }
-  if (probeInFlight) return probeInFlight;
   const skipProbe = isProxyRequired();
-  probeInFlight = (async () => {
+  if (probeInFlight?.url === url && probeInFlight.forceProxy === skipProbe) return probeInFlight.promise;
+  const pending = (async () => {
     const up = skipProbe ? true : await probe(url);
+    if (baseUrl() !== url || isProxyRequired() !== skipProbe) return resolveHandle();
     if (skipProbe) {
       process.stderr.write(
         `[@agentmemory/mcp] AGENTMEMORY_FORCE_PROXY set; skipping livez probe and trusting ${url}\n`,
@@ -200,10 +201,11 @@ export async function resolveHandle(): Promise<Handle> {
     cachedAt = Date.now();
     return local;
   })();
+  probeInFlight = { url, forceProxy: skipProbe, promise: pending };
   try {
-    return await probeInFlight;
+    return await pending;
   } finally {
-    probeInFlight = null;
+    if (probeInFlight?.promise === pending) probeInFlight = null;
   }
 }
 
