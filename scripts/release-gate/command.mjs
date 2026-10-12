@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
+export function assertSupportedPlatform() {
+  assert.notEqual(process.platform, "win32", "Native integration gates require macOS, Linux, or WSL2");
+}
+
 export function killProcess(pid) {
   if (!pid) return;
   try { process.kill(-pid, "SIGKILL"); } catch {}
@@ -8,6 +12,7 @@ export function killProcess(pid) {
 }
 
 export function runCommand(executable, args, { env, cwd, children = new Set(), timeoutMs = 90_000 } = {}) {
+  assertSupportedPlatform();
   return new Promise((done) => {
     const child = spawn(executable, args, { env, cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     if (child.pid) children.add(child.pid);

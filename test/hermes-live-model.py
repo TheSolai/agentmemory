@@ -65,7 +65,6 @@ def main(args):
     out = args.out.resolve()
     if out.exists():
         raise RuntimeError('Use a fresh output directory; existing evidence is preserved.')
-    out.mkdir(parents=True, mode=0o700)
     original_auth_hash = native.digest(args.codex_auth)
     auth = json.loads(args.codex_auth.read_text())
     access_token = auth.get('tokens', {}).get('access_token')
@@ -79,11 +78,12 @@ def main(args):
     package = args.package.resolve()
     cli = package / 'dist/cli.mjs'
     provider = package / 'integrations/hermes/__init__.py'
+    cli_hash = native.digest(cli)
+    provider_hash = native.digest(provider)
+    with args.engine.open('rb') as engine_source:
+        engine_source.read(1)
     daemon_home = out / 'daemon-home'
     engine = daemon_home / '.agentmemory/bin/iii'
-    engine.parent.mkdir(parents=True)
-    shutil.copy2(args.engine, engine)
-    engine.chmod(0o755)
     for _ in range(200):
         port = random.randint(12000, 18500)
         ports = [port, port + 1, port + 2, port + 3, port + 6353, port + 46023]
@@ -98,7 +98,11 @@ def main(args):
     durable = f'silver meadow {random.randint(1000, 9999)} amber owl'
     decoy = f'foreign canyon {random.randint(1000, 9999)} scarlet ibis'
     daemon_env = {'PATH': os.environ['PATH'], 'HOME': str(daemon_home), 'XDG_CONFIG_HOME': str(daemon_home / '.config'), 'AGENTMEMORY_URL': base, 'AGENTMEMORY_AUTO_COMPRESS': 'false', 'III_TELEMETRY_ENABLED': 'false', 'DO_NOT_TRACK': '1', 'NO_COLOR': '1', 'CI': 'true'}
-    summary = {'model': args.model, 'provider': 'openai-codex', 'host': str(args.host.resolve()), 'package': str(package), 'project': project, 'cli_sha256_before': native.digest(cli), 'provider_sha256_before': native.digest(provider), 'sessions': {}}
+    summary = {'model': args.model, 'provider': 'openai-codex', 'host': str(args.host.resolve()), 'package': str(package), 'project': project, 'cli_sha256_before': cli_hash, 'provider_sha256_before': provider_hash, 'sessions': {}}
+    out.mkdir(parents=True, mode=0o700)
+    engine.parent.mkdir(parents=True)
+    shutil.copy2(args.engine, engine)
+    engine.chmod(0o755)
     private_json(out / 'synthetic-facts.json', {'topic': topic, 'automatic': automatic, 'durable': durable, 'decoy': decoy})
     backend = None
     log = (out / 'backend.log').open('w')

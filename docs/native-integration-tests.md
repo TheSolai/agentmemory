@@ -51,7 +51,7 @@ Replacement requires the host's authoritative previous-content notification and 
 
 ## OpenClaw
 
-Use a Node runtime supported by the installed host. Repeat `--openclaw-cli` to exercise multiple versions:
+The native gate uses POSIX process groups for cleanup and runs on macOS, Linux, or WSL2. Native Windows is rejected before setup. Use a Node runtime supported by the installed host. Repeat `--openclaw-cli` to exercise multiple versions:
 
 ```bash
 npm run test:openclaw:packaged -- \

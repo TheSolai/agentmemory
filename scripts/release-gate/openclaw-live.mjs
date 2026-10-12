@@ -6,6 +6,7 @@ import { appendFileSync, chmodSync, closeSync, copyFileSync, cpSync, existsSync,
 import http from "node:http";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
+import { createRecordingProxy } from "./http-proxy.mjs";
 
 const options = { node: process.execPath, model: "openai/gpt-6-luna" };
 for (let i = 2; i < process.argv.length; i++) {
@@ -168,14 +169,10 @@ globalThis.fetch=async(input,init)=>{
 };
 `);
   await startBackend();
-  proxy = http.createServer(async (req, res) => {
-    let raw = ""; for await (const chunk of req) raw += chunk;
-    const response = await fetch(backendUrl + req.url, { method: req.method, headers: { "content-type": "application/json", ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) }, ...(raw ? { body: raw } : {}), signal: AbortSignal.timeout(10000) }).catch(() => null);
-    const text = response ? await response.text() : "{}";
-    const item = { scenario, path: req.url, body: raw ? JSON.parse(raw) : null, status: response?.status ?? 502, response: JSON.parse(text) };
+  proxy = http.createServer(createRecordingProxy({ backendUrl, record: (receipt) => {
+    const item = { scenario, ...receipt };
     wire.push(item); appendFileSync(join(root, "backend-wire.jsonl"), JSON.stringify(item) + "\n");
-    res.writeHead(item.status, { "content-type": "application/json" }); res.end(text);
-  });
+  } }));
   await new Promise((done) => proxy.listen(0, "127.0.0.1", done)); ports.push(proxy.address().port);
   cpSync(plugin, join(state, "extensions/agentmemory"), { recursive: true });
   const recorder = join(state, "extensions/agentmemory-live-recorder"); mkdirSync(recorder, { recursive: true });

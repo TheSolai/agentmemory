@@ -6,8 +6,9 @@ import { appendFileSync, chmodSync, closeSync, copyFileSync, cpSync, existsSync,
 import http from "node:http";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
-import { assertCommandCompleted, assertValidationRejected, killProcess as kill, runCommand } from "./command.mjs";
+import { assertCommandCompleted, assertSupportedPlatform, assertValidationRejected, killProcess as kill, runCommand } from "./command.mjs";
 
+assertSupportedPlatform();
 const options = { hosts: [], node: process.execPath };
 for (let i = 2; i < process.argv.length; i++) {
   const arg = process.argv[i];
