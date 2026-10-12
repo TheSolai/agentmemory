@@ -143,17 +143,37 @@ def main(args):
         references = [{'obsId': row['obsId'], 'sessionId': row['sessionId']} for row in found.get('results', [])]
         return api('smart-search', {'expandIds': references, 'project': scope, 'targetLayer': layer}) if references else {'results': []}
 
-    def turn(name, prompt, scope=project, skills=None):
-        home = out / name / 'home'
-        hermes_home = home / '.hermes'
-        hermes_home.mkdir(parents=True)
-        shutil.copytree(provider.parent, hermes_home / 'plugins/agentmemory')
-        shutil.copytree(package / 'plugin/skills', hermes_home / 'skills')
-        config = {'model': {'provider': 'openai-codex', 'default': args.model}, 'memory': {'provider': 'agentmemory'}, 'agent': {'max_turns': 3, 'reasoning_effort': 'low'}, 'auxiliary': {'title_generation': {'enabled': False}}, 'security': {'allow_lazy_installs': False}, 'display': {'tool_progress': False}}
-        private_json(hermes_home / 'config.yaml', config)
+    host_home = out / 'host-home'
+    workspace = out / 'shared-workspace'
+    workspace.mkdir()
+    installed_profiles = set()
+
+    def turn(name, prompt, scope=project, skills=None, profile='primary'):
+        home = host_home
+        hermes_home = home / 'profiles' / profile
+        (out / name).mkdir()
+        env = {**daemon_env, 'HOME': str(home), 'HERMES_HOME': str(hermes_home), 'XDG_CONFIG_HOME': str(home / '.config'), 'AGENTMEMORY_SECRET': secret, 'AGENTMEMORY_PROJECT_NAME': scope, 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': os.pathsep.join([str(args.host.resolve()), *[str(item.resolve()) for item in args.python_path]])}
+        if profile not in installed_profiles:
+            hermes_home.mkdir(parents=True)
+            config = {'model': {'provider': 'openai-codex', 'default': args.model}, 'agent': {'max_turns': 3, 'reasoning_effort': 'low'}, 'auxiliary': {'title_generation': {'enabled': False}}, 'security': {'allow_lazy_installs': False}, 'display': {'tool_progress': False}}
+            private_json(hermes_home / 'config.yaml', config)
+            command = [args.node, str(cli), 'connect', 'hermes', '--no-guidelines']
+            initial = (hermes_home / 'config.yaml').read_bytes()
+            dry = subprocess.run([*command, '--dry-run'], cwd=workspace, env=env, capture_output=True, text=True, timeout=30)
+            assert dry.returncode == 0, 'Packaged Hermes connector dry run failed.'
+            assert (hermes_home / 'config.yaml').read_bytes() == initial
+            assert not (hermes_home / 'plugins/agentmemory').exists(), 'Dry run installed plugin files.'
+            connected = subprocess.run(command, cwd=workspace, env=env, capture_output=True, text=True, timeout=30)
+            (out / name / 'connect.log').write_text(connected.stdout + connected.stderr)
+            assert connected.returncode == 0, 'Packaged Hermes connector failed.'
+            assert native.digest(hermes_home / 'plugins/agentmemory/__init__.py') == provider_hash
+            assert (hermes_home / 'skills/agentmemory/remember/SKILL.md').is_file()
+            installed = (hermes_home / 'config.yaml').read_bytes()
+            repeated = subprocess.run(command, cwd=workspace, env=env, capture_output=True, text=True, timeout=30)
+            assert repeated.returncode == 0 and (hermes_home / 'config.yaml').read_bytes() == installed, 'Connector is not idempotent.'
+            installed_profiles.add(profile)
         wire = out / name / 'model-wire.jsonl'
         wire.touch(mode=0o600)
-        env = {**daemon_env, 'HOME': str(home), 'HERMES_HOME': str(hermes_home), 'XDG_CONFIG_HOME': str(home / '.config'), 'AGENTMEMORY_SECRET': secret, 'AGENTMEMORY_PROJECT_NAME': scope, 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': os.pathsep.join([str(args.host.resolve()), *[str(item.resolve()) for item in args.python_path]])}
         before_sessions = {row['id'] for row in api('sessions')['sessions']}
         command = [str(args.python), str(Path(__file__).resolve()), '--child', str(wire), 'chat', '-q', prompt, '-Q', '--toolsets', 'memory,skills', '--max-turns', '3']
         if skills:
@@ -161,7 +181,7 @@ def main(args):
         private_json(out / name / 'prompt.json', {'prompt': prompt, 'project': scope})
         try:
             private_json(hermes_home / 'auth.json', {'active_provider': 'openai-codex', 'credential_pool': {'openai-codex': [{'id': 'isolated-live-access', 'label': 'isolated-live-access', 'auth_type': 'oauth', 'source': 'manual', 'priority': 0, 'access_token': access_token, 'base_url': 'https://chatgpt.com/backend-api/codex'}]}})
-            process = subprocess.Popen(command, cwd=out / name, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            process = subprocess.Popen(command, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
                 stdout, stderr = process.communicate(timeout=240)
             except BaseException:
@@ -176,6 +196,10 @@ def main(args):
             remove_token_copies(home, access_token)
         calls = [json.loads(line) for line in wire.read_text().splitlines()]
         assert calls, f'{name}: no actual Responses API request recorded.'
+        first_messages = [item for item in calls[0]['body'].get('input', []) if item.get('type') == 'message']
+        assert len(first_messages) == 1 and first_messages[0].get('role') == 'user', 'Fresh native session reused conversation history.'
+        if name not in ('capture', 'explicit-save'):
+            assert all(value not in prompt for value in (automatic, durable, decoy)), 'Submitted recall prompt leaked a withheld answer.'
         with sqlite3.connect('file:' + str(hermes_home / 'state.db') + '?mode=ro', uri=True) as connection:
             rows = connection.execute('SELECT role, content, tool_calls, tool_name FROM messages ORDER BY id').fetchall()
         transcript = [dict(zip(('role', 'content', 'tool_calls', 'tool_name'), row)) for row in rows]
@@ -186,7 +210,7 @@ def main(args):
         (out / name / 'model-answer.txt').write_text(answer)
         sessions = [row for row in api('sessions')['sessions'] if row['id'] not in before_sessions]
         assert sessions and all(row['status'] == 'completed' and row['observationCount'] >= 1 for row in sessions), sessions
-        summary['sessions'][name] = {'records': sessions, 'model_request_count': len(calls), 'fresh_home': True}
+        summary['sessions'][name] = {'records': sessions, 'model_request_count': len(calls), 'profile': profile, 'fresh_session': True}
         return answer, calls
 
     try:
@@ -206,16 +230,19 @@ def main(args):
         recalled, recall_calls = turn('fresh-recall', recall_prompt)
         assert automatic in recalled and decoy not in recalled, 'Fresh-session automatic recall answered incorrectly.'
         assert automatic in json.dumps(recall_calls[0]['body']), 'Fresh model input did not contain recalled evidence.'
+        assert summary['sessions']['capture']['records'][0]['id'] != summary['sessions']['fresh-recall']['records'][0]['id']
         assert decoy not in json.dumps(recall_calls), 'Foreign-project decoy leaked into model input.'
         assert len(recall_calls) == 1, 'Automatic recall unexpectedly required model tool calls.'
         summary['fresh_session_automatic_recall'] = True
-        save_prompt = f'Use the remember skill and the AgentMemory memory_save tool to save this synthetic fact: {topic} durable recovery phrase is {durable}. Set project to {project}, agentId to live-hermes-agent, concepts to calibration,recovery, and files to test/calibration.txt. Then return the saved memory ID.'
+        own_agent = automatic_rows[0]['observation']['agentId']
+        assert own_agent, 'Automatic capture must have a profile-scoped agent identity.'
+        save_prompt = f'Use the remember skill and the AgentMemory memory_save tool to save this synthetic fact: {topic} durable recovery phrase is {durable}. Set project to {project}, agentId to {own_agent}, concepts to calibration,recovery, and files to test/calibration.txt. Then return the saved memory ID.'
         saved_output, save_calls = turn('explicit-save', save_prompt, skills='remember')
         memories = expanded(topic, layer='memory')
         matching = [row for row in memories['results'] if durable in json.dumps(row)]
         assert matching, 'Real-model memory_save did not persist the requested fact.'
         saved_observation = matching[0]['observation']
-        assert saved_observation['agentId'] == 'live-hermes-agent'
+        assert saved_observation['agentId'] == own_agent
         assert set(saved_observation['concepts']) == {'calibration', 'recovery'}
         assert saved_observation['files'] == ['test/calibration.txt']
         memory_id = matching[0]['obsId']
@@ -233,6 +260,14 @@ def main(args):
         assert automatic in first_input and durable in first_input and decoy not in first_input
         assert len(restart_calls) == 1
         summary['restart_fresh_session_recall'] = True
+        foreign_profile, profile_calls = turn('foreign-profile', recall_prompt, profile='foreign')
+        assert 'UNKNOWN' in foreign_profile.upper() and automatic not in foreign_profile and durable not in foreign_profile
+        assert all(value not in json.dumps(profile_calls) for value in (automatic, durable, decoy)), 'Cross-profile context leaked in the same project and workspace.'
+        summary['same_workspace_foreign_profile_excluded'] = True
+        own_again, own_calls = turn('primary-after-foreign', recall_prompt)
+        assert automatic in own_again and automatic in json.dumps(own_calls[0]['body'])
+        summary['primary_profile_recall_after_foreign'] = True
+        summary['packaged_connector_profiles'] = sorted(installed_profiles)
         foreign, foreign_calls = turn('empty-project', recall_prompt, scope=project + '-empty')
         assert 'UNKNOWN' in foreign and automatic not in foreign and durable not in foreign
         assert all(value not in json.dumps(foreign_calls) for value in (automatic, durable, decoy)), 'Cross-project context leaked.'

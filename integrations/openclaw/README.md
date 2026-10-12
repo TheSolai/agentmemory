@@ -1,41 +1,37 @@
 # agentmemory for OpenClaw
 
-Use the native plugin for automatic recall and conversation capture. MCP tools and AgentMemory skills are separate, optional installations that use the same backend.
+The native plugin recalls relevant project memories before a turn and captures completed user/assistant conversations. It includes the shared AgentMemory skills. Start the AgentMemory backend before testing either capture or recall.
 
-## Start the backend
-
-```bash
-npx @agentmemory/agentmemory
-```
-
-The local backend stores its generated credential in `~/.agentmemory/secret`. `base_url` overrides `AGENTMEMORY_URL`; the default is localhost:3111. The native plugin prefers `AGENTMEMORY_SECRET`, then `~/.agentmemory/.env`, then the generated credential. Saved credentials are read only for loopback URLs and refreshed on each request. For a remote server, set `AGENTMEMORY_SECRET` explicitly and use HTTPS. The plugin refuses redirects so credentials are not forwarded to another endpoint.
-
-## Install the native plugin
-
-Copy `integrations/openclaw` from the repository or the extracted `@agentmemory/agentmemory` npm package into `~/.openclaw/extensions/agentmemory`:
+## Install and configure
 
 ```bash
-mkdir -p ~/.openclaw/extensions
-cp -r integrations/openclaw ~/.openclaw/extensions/agentmemory
+npm install -g @agentmemory/agentmemory
+agentmemory connect openclaw --dry-run
+agentmemory connect openclaw
 ```
 
-Merge this configuration into `~/.openclaw/openclaw.json`, preserving other plugins and settings:
+The connector installs the packaged plugin and its skills before activating it in the native configuration. It honors `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME` and `OPENCLAW_CONFIG_PATH`; the default is `~/.openclaw/openclaw.json`. Use the same environment as the OpenClaw profile you intend to configure. For a named profile, set `OPENCLAW_STATE_DIR` to that profile's state directory before connecting.
+
+Setup preserves unrelated settings, supports JSON5, backs up changed configuration and checks managed plugin files before upgrading. A different selected memory provider, disabled conversation access or locally modified installation requires an explicit `--force`. Failed activation rolls back the plugin changes. Authentication is verified only by a successful request after setup.
+
+Run `agentmemory` in another terminal, then restart OpenClaw and validate its configuration with `openclaw config validate`. A new conversation should produce an AgentMemory observation; a fresh session in the same profile should recall it.
+
+The connector selects `plugins.slots.memory: "agentmemory"` and grants `hooks.allowConversationAccess` for capture. A separately configured `hooks.allowPromptInjection: false` still disables recalled context. Copying the source folder manually does not record native installation provenance; use the connector or the host's installer with a prepared archive.
+
+## Credentials
+
+`plugins.entries.agentmemory.config.base_url` overrides `AGENTMEMORY_URL`; the default is `http://localhost:3111`. Use HTTPS for a remote backend.
+
+For an explicitly scoped credential, set `secret_env` to the **name** of an environment variable supplied to this OpenClaw profile:
 
 ```json
 {
   "plugins": {
-    "allow": ["agentmemory"],
-    "slots": { "memory": "agentmemory" },
     "entries": {
       "agentmemory": {
-        "enabled": true,
-        "hooks": { "allowConversationAccess": true },
         "config": {
-          "base_url": "http://localhost:3111",
-          "token_budget": 2000,
-          "min_confidence": 0.5,
-          "fallback_on_error": true,
-          "timeout_ms": 5000
+          "base_url": "https://memory.example.com",
+          "secret_env": "WORK_MEMORY_SECRET"
         }
       }
     }
@@ -43,50 +39,42 @@ Merge this configuration into `~/.openclaw/openclaw.json`, preserving other plug
 }
 ```
 
-Restart OpenClaw after installation. OpenClaw requires the conversation-access grant for capture. Recall uses the separate prompt-injection permission; `hooks.allowPromptInjection: false` disables recalled context. Manually copied plugins can also produce an installation-provenance warning; use the host's plugin installation command when managed provenance is required.
+Keep the value in the host's environment or secret management, not in this configuration. A missing or unresolved named variable never falls back to another key. Without `secret_env`, the plugin uses `AGENTMEMORY_SECRET`, then the local `~/.agentmemory/.env` or generated `~/.agentmemory/secret` for loopback endpoints only. File lookup remains bound to the home where the plugin registered. Remote endpoints require an explicit environment credential.
 
-The plugin uses `before_prompt_build`, supported by both tested OpenClaw versions, 2026.7.1-2 and 2026.10.2. It registers one recall phase, so hosts that still expose `before_agent_start` do not inject memory twice. It expands compact search results before injection, scopes both requests to the workspace's project name and native agent, and captures completed user/assistant turns through `agent_end`.
+Same-endpoint credential rotations take effect on the next request. Endpoint or credential-variable configuration changes require a plugin reload; an old instance refuses to send a new credential to its previous endpoint. Redirects are refused. `AGENTMEMORY_REQUIRE_HTTPS=1` rejects bearer authentication to remote plaintext HTTP; otherwise that combination warns once.
 
-Native hook context supplies the session ID or session key, workspace directory and agent ID. Project resolution follows `AGENTMEMORY_PROJECT_NAME`, the canonical Git repository name (including nested directories and linked worktrees), then the workspace directory's basename. A missing session or workspace skips the operation with a warning instead of performing an unscoped search. Session startup binds the native agent before capture. Repeated callbacks use the same durable event ID; failed session startup can be retried. Native `session_end` waits for in-flight captures before finalizing the backend session and clearing local startup state.
+## Profiles and lifecycle
 
-`min_confidence` is the minimum normalized retrieval score, from 0 to 1. `token_budget` bounds the complete injected block using an approximate allowance of four UTF-8 bytes per token; it is not a model-specific tokenizer. A zero budget disables recall. `timeout_ms` bounds each request. With `fallback_on_error: true`, failed requests warn and allow the turn to continue; this does not queue offline captures for later delivery. Setting it to `false` exposes errors to the host.
+Automatic recall and capture derive a stable backend agent identity from the active OpenClaw state directory and native agent ID. Sessions are also namespaced. Two profiles sharing a workspace and backend cannot collide solely because both use the native agent name `main` or the same session key. A new session or restart within the same profile retains its memory scope. Moving a profile directory changes that identity.
 
-The memory-slot registration supplies a prompt builder. It does not implement OpenClaw's in-process `MemoryPluginRuntime`; recall and capture use the authenticated AgentMemory REST API.
+Project resolution follows `AGENTMEMORY_PROJECT_NAME`, the canonical Git repository name (including linked worktrees), then the workspace basename. Missing workspace or session metadata skips capture/recall with a warning. Automatic recall searches and expands results with both project and profile-agent filters. Legacy unscoped memories and other clients' agent scopes are not automatically included. This is retrieval partitioning, not separate backend authorization or per-sender isolation within a shared gateway profile.
 
-## Add MCP tools
+The plugin registers only `before_prompt_build` for recall, avoiding duplicate injection on hosts that still expose the older hook. `agent_end` captures the latest completed user/assistant turn, bounded to 1,000 and 4,000 characters respectively. It does not capture individual tool executions. Stable event IDs make duplicate callbacks retryable. Session startup binds the scoped identity before capture, and `session_end` drains pending captures before finalizing a known session.
+
+Configuration supports `token_budget` (0 to 32,000; zero disables recall), `min_confidence` (0 to 1), `timeout_ms` (1 to 60,000), and `fallback_on_error`. The token budget bounds the complete injected context at approximately four UTF-8 bytes per token. Fallback warns and lets a turn continue; it does not queue failed captures for later delivery. The memory-slot capability supplies a prompt builder and uses the AgentMemory REST API, rather than implementing OpenClaw's in-process memory runtime.
+
+## Optional full MCP tools
 
 ```bash
-npx @agentmemory/agentmemory connect openclaw
+agentmemory connect openclaw --with-mcp
 ```
 
-The connector writes `mcp.servers.agentmemory`, preserves other native settings, backs up changed files, and supports `--dry-run`. It migrates the AgentMemory entry written by older connector versions under `mcpServers`. Customized native entries are left unchanged unless `--force` is supplied. JSON5 or malformed files are left unchanged with guidance to use OpenClaw's native configuration tools. Files with other legacy `mcpServers` entries are left untouched for a separate migration, because the host rejects that top-level key.
+This adds `mcp.servers.agentmemory`, pointing to the exact installed package's `dist/standalone.mjs`, with forced proxy mode. Keep that package installation available and rerun setup after moving it. Existing custom MCP settings are preserved unless `--force` is supplied. The connector migrates its recognized older `mcpServers.agentmemory` entry; unrelated legacy entries require separate migration.
 
-The native configuration shape is:
+MCP exposes the full shared backend tool surface. It does not enforce the native plugin's automatic profile filters and is suitable only for a deliberately shared, trusted backend. Skills requiring `memory_*` tools need this connection; native recall/capture itself does not. Verify the tools shown by the host before running a skill. Existing MCP connections are not removed by native-only setup.
 
-```json
-{
-  "mcp": {
-    "servers": {
-      "agentmemory": {
-        "transport": "stdio",
-        "command": "npx",
-        "args": ["-y", "@agentmemory/mcp"],
-        "env": { "AGENTMEMORY_TOOLS": "all", "AGENTMEMORY_FORCE_PROXY": "1" }
-      }
-    }
-  }
-}
+## Package and verify
+
+From a source checkout, build the standalone archive with:
+
+```bash
+npm run skills:gen
+npm run plugin:pack:openclaw
 ```
 
-The connector enables `AGENTMEMORY_FORCE_PROXY=1` so backend failures remain visible instead of silently using a separate local store. Existing custom overrides are preserved during migration. The MCP process inherits environment settings. Keep credentials in the environment or the local AgentMemory credential files rather than putting their values in this JSON. Validate the result with `openclaw config validate`.
+This prepares `dist/plugins/agentmemory-<version>.tgz` with plugin metadata, license and all 17 skills including their supporting files. Root `npm pack` also prepares these resources automatically. These commands create local artifacts and do not publish them.
 
-## Add skills
-
-Install the `plugin/skills` bundle separately using the AgentMemory skill installer, or configure OpenClaw's `skills.load.extraDirs` to the bundle's absolute directory. The root npm package includes both the native integration and the skills; copying only `integrations/openclaw` does not install skills or MCP tools. Skill instructions require the corresponding REST or MCP connection.
-
-## Verification
-
-The packaged native gate accepts an installed AgentMemory package, a Node runtime supported by the native hosts, their CLI entrypoints, and a cached pinned iii engine:
+The native release gate accepts an installed AgentMemory package and real host binaries:
 
 ```bash
 node scripts/release-gate/openclaw.mjs \
@@ -97,4 +85,4 @@ node scripts/release-gate/openclaw.mjs \
   --out /tmp/agentmemory-openclaw-gate
 ```
 
-Repeat `--openclaw-cli` to test multiple installed hosts. The gate uses isolated homes and synthetic credentials, inspects actual native model and backend traffic, and stops its own processes. Deterministic model fixtures verify hook/tool wiring and payloads, not external model answer quality or channel delivery.
+Repeat `--openclaw-cli` to exercise additional hosts. The deterministic gate inspects model and backend traffic. `scripts/release-gate/openclaw-live.mjs` exercises real model conversations with separate profiles and a backend restart; see `docs/native-integration-tests.md` for its required isolated runtime inputs.

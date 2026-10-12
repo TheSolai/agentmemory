@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -25,6 +25,7 @@ const configSchema = {
   properties: {
     enabled: { type: "boolean" },
     base_url: { type: "string" },
+    secret_env: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
     token_budget: { type: "integer", minimum: 0, maximum: 32000 },
     min_confidence: { type: "number", minimum: 0, maximum: 1 },
     fallback_on_error: { type: "boolean" },
@@ -81,14 +82,34 @@ function resolveProject(cwd) {
   return basename(cwd) || cwd;
 }
 
-function nativeContext(event, ctx = {}) {
+function profileNamespace(api) {
+  const expand = (value, home) => resolve(value.replace(/^~(?=$|[/\\])/, () => home));
+  const home = expand(process.env.OPENCLAW_HOME?.trim() || homedir(), homedir());
+  const preferred = join(home, ".openclaw");
+  const legacy = join(home, ".clawdbot");
+  const fallback = process.env.OPENCLAW_STATE_DIR?.trim()
+    ? expand(process.env.OPENCLAW_STATE_DIR.trim(), home)
+    : !existsSync(preferred) && existsSync(legacy) ? legacy : preferred;
+  let canonical = resolve(api.runtime?.state?.resolveStateDir?.() || fallback);
+  try { canonical = realpathSync(canonical); } catch {}
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 24);
+}
+
+function nativeAgent(event, ctx = {}) {
+  return [ctx.agentId, event?.agentId, process.env.AGENT_ID]
+    .find((value) => typeof value === "string" && value.trim())?.trim() || "main";
+}
+
+function nativeContext(event, ctx = {}, namespace) {
   const string = (...values) => values.find((value) => typeof value === "string" && value.trim())?.trim();
   const cwd = string(ctx.workspaceDir, event?.workspaceDir, event?.cwd);
   const sessionId = string(ctx.sessionId, ctx.sessionKey, event?.sessionId, event?.sessionKey);
   if (!cwd || !sessionId) return null;
-  return { cwd, project: resolveProject(cwd), sessionId,
-    agentId: string(ctx.agentId, event?.agentId, process.env.AGENT_ID),
-  };
+  const agent = nativeAgent(event, ctx);
+  const agentId = "openclaw-" + createHash("sha256").update(JSON.stringify([namespace, agent])).digest("hex");
+  const scopedSession = "openclaw-" + createHash("sha256").update(JSON.stringify([namespace, agent, sessionId])).digest("hex");
+  return { cwd, project: resolveProject(cwd), sessionId: scopedSession, agentId };
+
 }
 
 function formatResults(results) {
@@ -151,17 +172,17 @@ function usableSecret(value) {
   return trimmed;
 }
 
-function readAgentmemoryFile(name) {
+function readAgentmemoryFile(name, home = homedir()) {
   try {
-    return readFileSync(join(homedir(), ".agentmemory", name), "utf-8");
+    return readFileSync(join(home, ".agentmemory", name), "utf-8");
   } catch {
     return "";
   }
 }
 
-function envFileSecret() {
+function envFileSecret(home) {
   let found = "";
-  for (const line of readAgentmemoryFile(".env").split("\n")) {
+  for (const line of readAgentmemoryFile(".env", home).split("\n")) {
     const trimmed = line.trim();
     if (trimmed.startsWith("#")) continue;
     const eq = trimmed.indexOf("=");
@@ -186,11 +207,11 @@ function isLoopbackUrl(url) {
   }
 }
 
-export function resolveSecret(url, explicit) {
+export function resolveSecret(url, explicit, home = homedir()) {
   const configured = usableSecret(explicit);
   if (configured) return configured;
   if (!isLoopbackUrl(url)) return "";
-  return envFileSecret() || usableSecret(readAgentmemoryFile("secret"));
+  return envFileSecret(home) || usableSecret(readAgentmemoryFile("secret", home));
 }
 
 function createClient(cfg, api) {
@@ -202,7 +223,14 @@ function createClient(cfg, api) {
   }
   const timeoutMs = Number(cfg.timeout_ms || DEFAULT_TIMEOUT_MS);
   const fallbackOnError = cfg.fallback_on_error !== false;
-  const secret = () => resolveSecret(baseUrl, process.env.AGENTMEMORY_SECRET);
+  const credentialHome = homedir();
+  const secret = () => {
+    const currentUrl = String(api.pluginConfig?.base_url || process.env.AGENTMEMORY_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
+    if (currentUrl !== baseUrl || api.pluginConfig?.secret_env !== cfg.secret_env) {
+      throw new Error("agentmemory: endpoint or credential configuration changed; reload the plugin before using its credentials");
+    }
+    return cfg.secret_env ? usableSecret(process.env[cfg.secret_env]) : resolveSecret(baseUrl, process.env.AGENTMEMORY_SECRET, credentialHome);
+  };
   const guardPlaintextBearerAuth = createPlaintextBearerAuthGuard(
     (message) => api.logger.warn?.(message),
   );
@@ -247,6 +275,7 @@ const plugin = {
   register(api) {
     const cfg = {
       enabled: api.pluginConfig?.enabled !== false,
+      secret_env: api.pluginConfig?.secret_env,
       base_url: api.pluginConfig?.base_url || process.env.AGENTMEMORY_URL || DEFAULT_BASE_URL,
       token_budget: api.pluginConfig?.token_budget ?? 2000,
       min_confidence: api.pluginConfig?.min_confidence ?? 0.5,
@@ -254,6 +283,10 @@ const plugin = {
       timeout_ms: api.pluginConfig?.timeout_ms ?? DEFAULT_TIMEOUT_MS,
     };
     if (!cfg.enabled) return;
+    if (cfg.secret_env !== undefined && (typeof cfg.secret_env !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cfg.secret_env))) {
+      throw new Error("agentmemory: invalid secret_env");
+    }
+    const namespace = profileNamespace(api);
     if (!Number.isInteger(cfg.token_budget) || cfg.token_budget < 0 || cfg.token_budget > 32000 ||
         !Number.isFinite(cfg.min_confidence) || cfg.min_confidence < 0 || cfg.min_confidence > 1 ||
         !Number.isInteger(cfg.timeout_ms) || cfg.timeout_ms < 1 || cfg.timeout_ms > 60000) {
@@ -280,7 +313,7 @@ const plugin = {
       if (!cfg.enabled || cfg.token_budget === 0) return;
       const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
       if (!prompt) return;
-      const identity = nativeContext(event, ctx);
+      const identity = nativeContext(event, ctx, namespace);
       if (!identity) {
         api.logger.warn?.("agentmemory: recall skipped because native session/workspace metadata is missing");
         return;
@@ -304,30 +337,36 @@ const plugin = {
 
     const startedSessions = new Map();
     const captures = new Map();
+    const sessionAliases = new Map();
     const capture = async (event, ctx) => {
       if (!cfg.enabled || !event?.success || !Array.isArray(event.messages)) return;
       const userText = latestUserText(event.messages);
       const assistantText = lastAssistantText(event.messages);
       if (!userText || !assistantText) return;
-      const identity = nativeContext(event, ctx);
+      const identity = nativeContext(event, ctx, namespace);
       if (!identity) {
         api.logger.warn?.("agentmemory: capture skipped because native session/workspace metadata is missing");
         return;
       }
       const key = JSON.stringify(identity);
-      if (!startedSessions.has(key)) {
-        const starting = client.postJson("/agentmemory/session/start", identity);
+      let starting = startedSessions.get(key);
+      if (!starting) {
+        starting = client.postJson("/agentmemory/session/start", identity);
         startedSessions.set(key, starting);
         if (startedSessions.size > 256) startedSessions.delete(startedSessions.keys().next().value);
       }
       let started;
       try {
-        started = await startedSessions.get(key);
+        started = await starting;
       } catch (error) {
-        startedSessions.delete(key);
+        if (startedSessions.get(key) === starting) startedSessions.delete(key);
         throw error;
       }
-      if (!started) { startedSessions.delete(key); return; }
+      if (started?.session?.id !== identity.sessionId) {
+        if (startedSessions.get(key) === starting) startedSessions.delete(key);
+        if (started) api.logger.warn?.("agentmemory: capture skipped because session startup did not confirm the requested session");
+        return;
+      }
       const eventId = "openclaw-" + createHash("sha256").update(JSON.stringify([
         identity, ctx?.runId || event.runId || null, event.messages.length, userText, assistantText,
       ])).digest("hex");
@@ -344,9 +383,16 @@ const plugin = {
       });
     };
     api.on("agent_end", async (event, ctx) => {
-      const identity = nativeContext(event, ctx);
+      const identity = nativeContext(event, ctx, namespace);
       const task = capture(event, ctx);
       if (!identity) return task;
+      const aliases = [ctx?.sessionId, ctx?.sessionKey, event?.sessionId, event?.sessionKey]
+        .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim());
+      sessionAliases.set(identity.sessionId, { aliases, nativeAgent: nativeAgent(event, ctx) });
+      if (sessionAliases.size > 1024) {
+        const idle = [...sessionAliases.keys()].find((id) => id !== identity.sessionId && !captures.has(id));
+        if (idle) sessionAliases.delete(idle);
+      }
       const pending = captures.get(identity.sessionId) || new Set();
       pending.add(task);
       captures.set(identity.sessionId, pending);
@@ -359,12 +405,15 @@ const plugin = {
     api.on("session_end", async (event, ctx) => {
       const candidates = [ctx?.sessionId, event?.sessionId, ctx?.sessionKey, event?.sessionKey]
         .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim());
-      const knownIds = new Set([...startedSessions.keys()].map((key) => JSON.parse(key).sessionId));
-      const sessionId = candidates.find((id) => captures.has(id) || knownIds.has(id)) || candidates[0];
-      if (!sessionId) return;
+      const agent = ctx?.agentId || event?.agentId ? nativeAgent(event, ctx) : undefined;
+      const matching = [...sessionAliases].filter(([, value]) =>
+        (!agent || value.nativeAgent === agent) && candidates.some((id) => value.aliases.includes(id)));
+      if (matching.length !== 1) return;
+      const sessionId = matching[0][0];
       await Promise.allSettled([...(captures.get(sessionId) || [])]);
       const result = await client.postJson("/agentmemory/session/end", { sessionId, final: true });
       if (result) {
+        sessionAliases.delete(sessionId);
         for (const key of startedSessions.keys()) {
           if (JSON.parse(key).sessionId === sessionId) startedSessions.delete(key);
         }

@@ -1,91 +1,84 @@
-# agentmemory for Hermes Agent
+# AgentMemory for Hermes Agent
 
-The native memory provider adds automatic recall, conversation capture and three memory tools to Hermes. A separate MCP connection exposes all 54 AgentMemory tools. Start the AgentMemory server before using either integration.
+The native provider adds automatic recall, conversation capture, and three memory tools to Hermes. Its default memory scope follows the active Hermes profile and, on a messaging gateway, the author of each turn. The connector installs the provider and the bundled skills from the same AgentMemory package.
 
-## Native provider
+## Setup
 
-Install the AgentMemory package, then copy its provider into your active Hermes home:
-
-```bash
-npm install --prefix ./agentmemory-runtime @agentmemory/agentmemory
-mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins/agentmemory"
-cp -R ./agentmemory-runtime/node_modules/@agentmemory/agentmemory/integrations/hermes/. \
-  "${HERMES_HOME:-$HOME/.hermes}/plugins/agentmemory/"
-```
-
-Add this to the active Hermes `config.yaml`:
-
-```yaml
-memory:
-  provider: agentmemory
-```
-
-Start the server in a separate terminal:
+Start AgentMemory in a separate terminal, then connect the installed package to Hermes:
 
 ```bash
-npx @agentmemory/agentmemory
+agentmemory
 ```
 
-Use `hermes memory status` to confirm that the provider loads. Availability checks validate configuration without contacting the server. An actual `memory_save` or `memory_recall` call verifies connectivity and authentication.
+```bash
+agentmemory connect hermes
+hermes memory setup
+hermes memory status
+```
 
-The provider uses these lifecycle hooks:
+In the Hermes setup wizard, select AgentMemory and enter the backend URL and its bearer credential. An optional project name overrides workspace detection. Run the commands with the same `HERMES_HOME` used to launch Hermes; without it, the connector uses `~/.hermes`.
 
-- `system_prompt_block` retrieves project context at session start.
-- `prefetch` retrieves project memories before a model call.
-- `sync_turn` captures conversation text through the host's serialized background worker.
-- `on_session_switch` completes the previous session and binds subsequent writes to the new session.
-- `on_session_end` completes the current session, with failed completion requests remaining retryable.
-- `on_pre_compress` returns bounded context for the summary prompt without modifying the transcript.
-- `on_memory_write` saves native add and replacement content to AgentMemory.
+The connector installs the provider into `$HERMES_HOME/plugins/agentmemory` and the skills into `$HERMES_HOME/skills/agentmemory`, then enables the provider in `config.yaml`. It preserves unrelated YAML settings. Existing custom provider files, disabled integrations, and a different selected memory provider require an explicit `--force` replacement, with a backup. Use `--dry-run` to inspect the intended changes.
 
-Conversation capture currently retains up to 500 user characters and 2,000 assistant characters per turn. It does not capture individual tool executions. Native replacement evolves an owned mirrored record only when Hermes supplies its full `previous_content` and the provider has the exact daemon ID from its own earlier write. The server atomically rejects a version that another client has already evolved, rather than changing that client's history. A profile-local ownership file preserves that mapping across restarts. Notifications from older hosts without this identity save the replacement and report that the previous record could not be superseded; the provider never guesses using a text search. Superseded versions remain in their version chain. Removing an entry from Hermes does not delete matching AgentMemory records. Use an explicit AgentMemory deletion tool with verified durable-memory IDs for that operation.
+The connector does not start the backend or verify authentication. `hermes memory status` checks configuration and provider loading. A real save and recall verifies connectivity:
 
-Compression context is a best-effort contribution, not a durable transcript checkpoint. The provider does not opt into Hermes checkpoint API v2. Shutdown waits for in-flight provider writes within a bounded deadline and reports a pending write if the deadline expires. This is not an offline spool or a guarantee against process termination.
+1. Start a new Hermes session and ask it to remember a distinctive, non-sensitive fact using `memory_save`.
+2. Start another session under the same Hermes home and project, then ask it to recall that fact using `memory_recall`.
+3. Restart AgentMemory with the same data directory and repeat the recall.
+4. Use a different Hermes home with the same project and workspace. Default native recall should not return the first profile's fact.
 
-## Credentials and configuration
+## Credentials and profile scope
 
-URL precedence is the shell's `AGENTMEMORY_URL`, the active Hermes home's `agentmemory.json`, the local AgentMemory dotenv file, then `http://localhost:3111`. `hermes memory setup agentmemory` saves its URL in that active Hermes home. Secret fields remain managed by Hermes rather than being written to the provider's JSON file.
+The provider reads credentials only through Hermes's `agent.secret_scope.get_secret` API. Hermes manages the values entered through its setup wizard. The provider never reads AgentMemory's `.env` or `secret` files, and ignores legacy credentials in `agentmemory.json`. If the backend generated a local secret, supply that credential through Hermes setup as well.
 
-For a local daemon, the provider reads the secret from `~/.agentmemory/.env`, `$XDG_CONFIG_HOME/agentmemory/.env`, or `~/.agentmemory/secret`. These saved local credentials are used only for exact `localhost` or numeric loopback IP addresses. They are never promoted into the process environment or attached to remote DNS names. For a remote daemon, explicitly supply `AGENTMEMORY_SECRET` for that endpoint. Legacy secrets already present in `agentmemory.json` apply only to that file's endpoint, not an overridden URL. Same-endpoint credential rotations are picked up on the next request. Changing the endpoint requires restarting the session. Hermes's scoped secret accessor is used when available; routed profiles do not inherit local daemon credentials.
+URL precedence is the active Hermes scope's `AGENTMEMORY_URL`, the active home's non-secret `agentmemory.json`, then `http://localhost:3111`. `save_config` writes only the validated URL. A missing scoped credential API, a missing routed-profile scope, or a mismatch between the active home and credential scope fails closed. An initialized provider cannot send requests under another profile or endpoint. Same-endpoint credential rotations apply on the next request; changing the endpoint or explicit identity requires a fresh session.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENTMEMORY_URL` | `http://localhost:3111` | HTTP or HTTPS daemon endpoint |
-| `AGENTMEMORY_SECRET` | Local daemon secret on loopback | Explicit bearer credential |
-| `AGENTMEMORY_PROJECT_NAME` | Git repository name or working directory name | Canonical project scope |
-| `AGENTMEMORY_REQUIRE_HTTPS` | Off | Refuse bearer authentication over remote plaintext HTTP |
+| `AGENTMEMORY_URL` | `http://localhost:3111` | HTTP or HTTPS backend endpoint |
+| `AGENTMEMORY_SECRET` | Unset | Bearer credential resolved by Hermes |
+| `AGENTMEMORY_PROJECT_NAME` | Active workspace's repository or directory name | Explicit project scope |
+| `AGENTMEMORY_AGENT_ID` | Derived from the Hermes home and author | Deliberate shared identity override |
+| `AGENTMEMORY_REQUIRE_HTTPS` | Off | Process policy: refuse bearer authentication over remote plaintext HTTP |
 
-Remote plaintext HTTP otherwise emits a warning. Redirects are refused so credentials and memory payloads stay on the configured endpoint. Authentication failures and unavailable servers produce actionable errors, rather than empty successful recall results.
+The default `agentId` is a deterministic hash of the canonical Hermes home and the local or gateway-author identity. Backend session IDs also include that identity, so equal Hermes session IDs in separate profiles or gateway authors do not collide. New sessions and restarts under the same profile retain the same default identity. Moving a profile to another directory creates a new default scope.
 
-The native tools accept `project` and `agentId`. Save also accepts CSV `concepts` and `files`; recall/search preserve backend result IDs and metadata. Project defaults to the current project. These fields provide explicit scope controls, not automatic multi-profile or gateway identity isolation.
+Hermes supplies the active workspace as `cwd` when available. The provider otherwise uses Hermes's runtime workspace, then the local CLI working directory or nonlocal profile home. `AGENTMEMORY_PROJECT_NAME` provides a deliberate override. Gateway author changes are applied per turn; a gateway turn without an author cannot fall back to the profile's previous author. Background writes retain the context of the originating turn. Subagent, cron, and flush contexts do not write native memory.
 
-## MCP and skills
+Native `memory_save`, `memory_recall`, and `memory_search` default to the current project and identity. They accept explicit `project` and `agentId` arguments for a deliberately selected scope; wildcard identities are rejected. `AGENTMEMORY_AGENT_ID` can deliberately share an identity across profiles. These filters are application-level scope, not separate server credentials or a replacement for access control. Legacy unscoped records are not automatically included in native recall.
 
-For the complete tool surface, add a separate MCP connection to the active Hermes `config.yaml`:
+Remote plaintext HTTP emits a warning unless HTTPS is required. Redirects are refused. Authentication failures and unavailable servers return errors, never an empty successful recall result or a save into a fallback store.
 
-```yaml
-mcp_servers:
-  agentmemory:
-    command: npx
-    args: ["-y", "@agentmemory/mcp"]
-    env:
-      AGENTMEMORY_URL: "${AGENTMEMORY_URL}"
-      AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET}"
-      AGENTMEMORY_FORCE_PROXY: "1"
-```
+## Lifecycle and limits
 
-This alone does not install or enable the native provider. Keep the `memory.provider` configuration only when its provider files are installed.
+- `system_prompt_block` supplies static tool guidance. Recalled content enters through `prefetch` with project and identity filters.
+- `on_turn_start` records the current author in context-local state.
+- `sync_turn` captures conversation text through Hermes's serialized background worker.
+- `on_session_switch` ends the previous session and binds later writes to the new session.
+- `on_session_end` completes the current session; failed completion requests remain retryable.
+- `on_pre_compress` returns bounded, scoped recall without changing the transcript.
+- `on_memory_write` mirrors native add and replacement content.
 
-Hermes resolves these environment references using its active credential scope. Unset values remain placeholders, which the AgentMemory MCP bridge treats as unset: the URL defaults to localhost and the local secret is read automatically. For a custom port or remote daemon, set `AGENTMEMORY_URL` in the Hermes environment so both the native provider and MCP bridge use the same endpoint. The MCP bridge does not read the provider's `agentmemory.json`. Supply remote authentication through `AGENTMEMORY_SECRET`. Explicit proxy mode reports an unavailable daemon instead of quietly saving into a separate standalone store.
+Capture retains up to 500 user characters and 2,000 assistant characters per turn. It does not capture individual tool executions. Automatic recall and compression context exclude project-wide lessons because those records do not carry the provider's author scope.
 
-Install the shared skills separately:
+Native replacement evolves a record only when Hermes supplies its full `previous_content` and the provider has the exact backend ID from its own earlier write. A profile-local ownership file, keyed by endpoint, project, and identity, preserves that mapping across restarts. If another client has already evolved the record, the server rejects the conflict. Older notifications without previous-content identity save the replacement and report that the earlier record could not be superseded. Removing a native Hermes entry does not delete AgentMemory records; use an explicit AgentMemory deletion tool with verified record IDs.
+
+Compression context is best effort, not checkpoint API v2. Shutdown waits for in-flight writes within a bounded deadline. There is no durable offline queue, and repeated notifications without a stable event ID are not deduplicated by the provider.
+
+## Optional MCP tools
+
+Native setup includes save, recall, and search. Enable the wider AgentMemory tool surface only when needed:
 
 ```bash
-npx skills add rohitg00/agentmemory --agent hermes-agent --global
+agentmemory connect hermes --with-mcp
 ```
 
-The native provider folder does not contain the shared skills. Verify discovery with Hermes's `skills_list` and `skill_view` tools. A workflow needing tools beyond native save/recall/search also requires the MCP connection; use the actual names shown by the host's tool catalog.
+This adds a bundled stdio bridge under `mcp_servers.agentmemory` in the same profile's `config.yaml`. It uses the installed package, requires the configured backend, and obtains URL and secret values from Hermes. It does not fetch a second npm runtime or silently create a standalone memory store. Re-run the connector after upgrading to refresh the installed provider and skills. Existing MCP entries are preserved; if the package location changed, review any custom MCP settings and run `agentmemory connect hermes --with-mcp --force` to refresh its absolute runtime path with a backup.
+
+The MCP bridge does not enforce the native provider's profile or author filters. Its tools include operations across the configured backend. Enable it only for a trusted, deliberately shared backend, or use a separate AgentMemory instance and credential for each isolated user. A workflow requiring tools beyond native save, recall, and search needs this explicit MCP connection; use the names exposed by Hermes's tool catalog.
+
+The skills are installed with the native provider. Verify discovery with Hermes's `skills_list` and `skill_view`. Each skill includes its referenced support files.
 
 ## Verification
 
-Run the network-free regression suite with `python3 test/hermes-provider-contracts.py` or `npx vitest run test/hermes-plugin.test.ts`. The native integration harness in `test/hermes-native-e2e.py` installs the provider from an already installed package and runs the actual Hermes loader and CLI against the packaged AgentMemory daemon with a local deterministic model. Its `--help` lists the isolated runtime inputs.
+Run `python3 test/hermes-provider-contracts.py` or `npx vitest run test/hermes-plugin.test.ts` for the provider regression suite. The packaged runtime harness in `test/hermes-native-e2e.py` exercises the real Hermes loader and CLI against the installed AgentMemory daemon. The separate `test/hermes-live-model.py` harness tests real model conversations, fresh-session recall, and profile isolation. Use each harness's `--help` for isolated runtime inputs.

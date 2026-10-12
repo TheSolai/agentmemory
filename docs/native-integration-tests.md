@@ -15,7 +15,7 @@ npm install --prefix /path/to/isolated-runtime --no-package-lock \
   /path/to/artifacts/agentmemory-mcp-<version>.tgz
 ```
 
-The root tarball must include `integrations/hermes`, `integrations/openclaw` and `plugin/skills`. Python cache files must not be included. Install both tarballs together so the MCP shim resolves the candidate package rather than an older registry release. The pinned iii engine can be cached by the standard release gate.
+The root tarball must include `integrations/hermes`, `integrations/openclaw` and `plugin/skills`; the OpenClaw directory also contains its own 17 skills and supporting files. `npm pack` prepares those resources automatically. `npm run plugin:pack:openclaw` creates the standalone plugin archive for native installation. Python cache files must not be included. Install both tarballs together so the MCP shim resolves the candidate package rather than an older registry release. The pinned iii engine can be cached by the standard release gate.
 
 ## Skills and HTTP/MCP contracts
 
@@ -45,7 +45,7 @@ python3 test/hermes-native-e2e.py \
   --out /tmp/agentmemory-hermes-gate
 ```
 
-The harness loads the copied provider through Hermes, invokes native memory tools and lifecycle dispatch, runs its actual CLI against a deterministic model, and verifies full recalled content in model requests and captured records in the daemon. It also checks skills and the full MCP tool connection, credentials, session switching, compression, replacement and restart. Use `--python-path` if the host needs an additional isolated dependency directory.
+The harness runs the packaged `connect hermes` command with dry-run and repeat-install checks, loads its installed provider through Hermes, invokes native memory tools and lifecycle dispatch, runs its actual CLI against a deterministic model, and verifies full recalled content in model requests and captured records in the daemon. It also checks skills and the optional `--with-mcp` connection, missing and incorrect credentials, rotation and endpoint changes, session switching, compression, replacement and restart. Gateway tests isolate two authors within one session and reject anonymous writes. Use `--python-path` if the host needs an additional isolated dependency directory.
 
 Replacement requires the host's authoritative previous-content notification and the provider's owned ID. Older hosts without that notification must report the limitation and retain the old record. The gate measures this using the native memory tool's actual result rather than inventing metadata.
 
@@ -88,7 +88,7 @@ node scripts/release-gate/openclaw-live.mjs \
   --out /tmp/agentmemory-openclaw-live
 ```
 
-Both gates generate random synthetic facts, verify automatic capture in the daemon, then ask for the withheld facts in fresh sessions before and after restarting the daemon. Model input and stored observation IDs establish that recall came from AgentMemory rather than prior chat history. Foreign project or agent facts must stay out of recalled context. Hermes additionally exercises the remember skill, native save metadata and returned memory ID. Host responses come from the real provider without response substitution.
+Both gates generate random synthetic facts, verify automatic capture in the daemon, then ask for the withheld facts in fresh sessions before and after restarting the daemon. Model input and stored observation IDs establish that recall came from AgentMemory rather than prior chat history. The foreign-profile check uses the same OS home, workspace and backend with a different native profile directory. That profile must exclude the captured fact; returning to the original profile must recover it. Foreign project or agent facts must also stay out of recalled context. Hermes additionally exercises the remember skill, native save metadata and returned memory ID. Host responses come from the real provider without response substitution.
 
 Use fresh output directories. Logs contain synthetic conversations and model inputs, so keep them private. Inspect the summary's success, unchanged-package, credential-cleanup and closed-port checks. These gates cover native local conversations; they do not send messages through Telegram, Discord or other channels.
 
@@ -96,4 +96,6 @@ Use fresh output directories. Logs contain synthetic conversations and model inp
 
 Each gate writes a JSON summary and logs to its output directory. Check success flags, unchanged package hashes and process cleanup. The network-free Hermes contracts also run through `test/hermes-plugin.test.ts` during `npm test`.
 
-Deterministic responses verify host discovery, tool dispatch, lifecycle wiring and serialization. They do not measure external model answer quality, chat-channel delivery, cross-profile access-control policy, crash-durable native capture or exhaustive host-version compatibility. A native provider, MCP connection and skill installation are distinct surfaces; each must be tested separately.
+Deterministic responses verify host discovery, tool dispatch, lifecycle wiring and serialization. They do not measure external model answer quality, chat-channel delivery, backend authorization between untrusted tenants, crash-durable native capture or exhaustive host-version compatibility. A native provider, MCP connection and skill installation are distinct surfaces; each must be tested separately.
+
+Native profile filters apply to automatic native recall/capture. The optional full MCP connection exposes shared backend tools and deliberately does not impose those filters. Test both paths without equating native profile partitioning with an authorization boundary.

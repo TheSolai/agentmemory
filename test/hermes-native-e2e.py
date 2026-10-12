@@ -71,7 +71,8 @@ def probe(out):
     manager.shutdown_all()
     sessions = {item['id']: item for item in api(base, 'sessions')['sessions']}
     assert provider._session_id == 'native-new'
-    for session_id in ['native-old', 'native-new']:
+    for raw_id in ['native-old', 'native-new']:
+        session_id = provider._scoped_session_id(raw_id)
         assert sessions[session_id]['status'] == 'completed', sessions[session_id]
         assert sessions[session_id]['observationCount'] >= 1, sessions[session_id]
     from agent.secret_scope import set_multiplex_active, set_secret_scope, reset_secret_scope
@@ -91,16 +92,53 @@ def probe(out):
             reset_secret_scope(token)
     finally:
         set_multiplex_active(False)
-    os.environ['AGENTMEMORY_SECRET'] = 'synthetic-wrong-secret'
-    denied = load_memory_provider('agentmemory')
+    correct_secret = os.environ['AGENTMEMORY_SECRET']
+    denied = type(provider)()
     denied.initialize('auth-failure', cwd=os.getcwd())
-    for name, args in [('memory_search', {'query': 'NATIVE_METADATA_LYNX'}), ('memory_save', {'content': 'MUST_NOT_SAVE_BAD_AUTH'})]:
-        result = json.loads(denied.handle_tool_call(name, args))
-        assert result.get('errorCode') == 'authentication' and result.get('success') is False, result
+    try:
+        for bad_secret in ['synthetic-wrong-secret', None]:
+            if bad_secret is None:
+                os.environ.pop('AGENTMEMORY_SECRET', None)
+            else:
+                os.environ['AGENTMEMORY_SECRET'] = bad_secret
+            for name, arguments in [('memory_search', {'query': 'NATIVE_METADATA_LYNX'}), ('memory_save', {'content': 'MUST_NOT_SAVE_BAD_AUTH'})]:
+                result = json.loads(denied.handle_tool_call(name, arguments))
+                assert result.get('errorCode') == 'authentication' and result.get('success') is False, result
+        os.environ['AGENTMEMORY_SECRET'] = correct_secret
+        recovered = json.loads(denied.handle_tool_call('memory_recall', {'query': 'NATIVE_METADATA_LYNX'}))
+        assert saved['id'] in json.dumps(recovered), recovered
+        os.environ['AGENTMEMORY_URL'] = 'https://changed-endpoint.example.invalid'
+        rebound = json.loads(denied.handle_tool_call('memory_save', {'content': 'MUST_NOT_SAVE_REBOUND'}))
+        assert rebound.get('errorCode') == 'configuration_changed' and rebound.get('success') is False, rebound
+    finally:
+        os.environ['AGENTMEMORY_SECRET'] = correct_secret
+        os.environ['AGENTMEMORY_URL'] = base
+        denied.shutdown()
+    assert 'MUST_NOT_SAVE_BAD_AUTH' not in json.dumps(api(base, 'smart-search', {'query': 'MUST_NOT_SAVE_BAD_AUTH', 'project': 'hermes-native-e2e'}))
+    previous_agent = os.environ.pop('AGENTMEMORY_AGENT_ID', None)
+    gateway = type(provider)()
+    try:
+        gateway.initialize('shared-gateway-room', cwd=os.getcwd(), platform='telegram')
+        missing_author = json.loads(gateway.handle_tool_call('memory_save', {'content': 'MUST_NOT_SAVE_ANONYMOUS'}))
+        assert missing_author.get('success') is False, missing_author
+        for author, fact in [('alice', 'GATEWAY_ALICE_CEDAR'), ('bob', 'GATEWAY_BOB_MAPLE')]:
+            gateway.sync_turn('NATIVE_GATEWAY_ORCHID ' + fact, 'Acknowledged ' + fact, turn_author={'id': author})
+        author_ids = []
+        for author, own, foreign in [('alice', 'GATEWAY_ALICE_CEDAR', 'GATEWAY_BOB_MAPLE'), ('bob', 'GATEWAY_BOB_MAPLE', 'GATEWAY_ALICE_CEDAR')]:
+            gateway.on_turn_start(1, 'NATIVE_GATEWAY_ORCHID', author_id=author)
+            recalled = gateway.prefetch('NATIVE_GATEWAY_ORCHID')
+            assert own in recalled and foreign not in recalled, recalled
+            author_ids.append(gateway._agent_id)
+        assert author_ids[0] != author_ids[1]
+        gateway.on_session_end([])
+        gateway.shutdown()
+    finally:
+        if previous_agent is not None:
+            os.environ['AGENTMEMORY_AGENT_ID'] = previous_agent
     inventory = json.loads(skills_list())
     skill = json.loads(skill_view('remember'))
     assert 'remember' in json.dumps(inventory) and 'memory_save' in json.dumps(skill), (inventory, skill)
-    summary = {'native_metadata': True, 'recall_identity': True, 'replacement_content_mirrored': True, 'native_previous_content_available': has_previous_entry, 'old_record_superseded': not old_recalled, 'session_switch_completed': True, 'compression_transcript_unchanged': True, 'auth_errors_visible': True, 'scoped_credentials_fail_closed': True, 'skills_discovered': True, 'saved_id': saved['id']}
+    summary = {'native_metadata': True, 'recall_identity': True, 'replacement_content_mirrored': True, 'native_previous_content_available': has_previous_entry, 'old_record_superseded': not old_recalled, 'session_switch_completed': True, 'compression_transcript_unchanged': True, 'auth_errors_visible': True, 'scoped_credentials_fail_closed': True, 'missing_credentials_rejected': True, 'credential_recovery_same_provider': True, 'endpoint_change_requires_restart': True, 'gateway_authors_isolated': True, 'skills_discovered': True, 'saved_id': saved['id']}
     (out / 'native-summary.json').write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary))
 
@@ -140,8 +178,6 @@ def run(args):
     package = args.package.resolve()
     cli = package / 'dist/cli.mjs'
     provider_file = package / 'integrations/hermes/__init__.py'
-    shutil.copytree(provider_file.parent, hh / 'plugins/agentmemory')
-    shutil.copytree(package / 'plugin/skills', hh / 'skills')
     engine = home / '.agentmemory/bin/iii'
     engine.parent.mkdir(parents=True)
     shutil.copy2(args.engine, engine)
@@ -155,7 +191,7 @@ def run(args):
     else:
         raise RuntimeError('No free daemon port block.')
     base = f'http://127.0.0.1:{port}'
-    env = {'PATH': os.environ['PATH'], 'HOME': str(home), 'HERMES_HOME': str(hh), 'XDG_CONFIG_HOME': str(home / '.config'), 'AGENTMEMORY_URL': base, 'AGENTMEMORY_PROJECT_NAME': 'hermes-native-e2e', 'AGENTMEMORY_AUTO_COMPRESS': 'false', 'III_TELEMETRY_ENABLED': 'false', 'NO_COLOR': '1', 'DO_NOT_TRACK': '1', 'CI': 'true', 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': os.pathsep.join([str(args.host.resolve()), *[str(item.resolve()) for item in args.python_path]])}
+    env = {'PATH': os.environ['PATH'], 'HOME': str(home), 'HERMES_HOME': str(hh), 'XDG_CONFIG_HOME': str(home / '.config'), 'AGENTMEMORY_URL': base, 'AGENTMEMORY_PROJECT_NAME': 'hermes-native-e2e', 'AGENTMEMORY_AGENT_ID': 'test-agent', 'AGENTMEMORY_AUTO_COMPRESS': 'false', 'III_TELEMETRY_ENABLED': 'false', 'NO_COLOR': '1', 'DO_NOT_TRACK': '1', 'CI': 'true', 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': os.pathsep.join([str(args.host.resolve()), *[str(item.resolve()) for item in args.python_path]])}
     requests = []
     mode = {'mcp': False, 'bad_auth': False, 'offline': False, 'stop_on_save': False}
     class Model(BaseHTTPRequestHandler):
@@ -220,8 +256,6 @@ def run(args):
   base_url: http://127.0.0.1:{model.server_port}/v1
   api_key: synthetic-local-only
   api_mode: chat_completions
-memory:
-  provider: agentmemory
 security:
   allow_lazy_installs: false
 agent:
@@ -266,13 +300,22 @@ display:
             return api(base, path, body)
     try:
         start()
-        local_api('remember', {'content': 'PREFETCH_HERON ' + 'long evidence prefix ' * 16 + 'requires exact turquoise readiness evidence.', 'project': 'hermes-native-e2e'})
+        connector = subprocess.run([args.node, str(cli), 'connect', 'hermes', '--no-guidelines'], cwd=out, env=env, text=True, capture_output=True, timeout=30)
+        (out / 'connect.log').write_text(connector.stdout + connector.stderr)
+        assert connector.returncode == 0, 'Packaged Hermes connector failed.'
+        assert digest(hh / 'plugins/agentmemory/__init__.py') == digest(provider_file)
+        assert (hh / 'skills/agentmemory/remember/SKILL.md').is_file()
+        summary['packaged_connector_installed'] = True
+        local_api('remember', {'content': 'PREFETCH_HERON ' + 'long evidence prefix ' * 16 + 'requires exact turquoise readiness evidence.', 'project': 'hermes-native-e2e', 'agentId': 'test-agent'})
         host_run([str(Path(__file__).resolve()), '--probe', str(out)], 'native-probe')
+        assert 'mcp_servers:' not in (hh / 'config.yaml').read_text()
         for mcp in [False, True]:
             mode['mcp'] = mcp
             if mcp:
-                with (hh / 'config.yaml').open('a') as handle:
-                    handle.write('\nmcp_servers:\n  agentmemory:\n    command: ' + json.dumps(args.node) + '\n    args: [' + json.dumps(str(package / 'dist/standalone.mjs')) + ']\n    env:\n      AGENTMEMORY_URL: "${AGENTMEMORY_URL}"\n      AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET}"\n      AGENTMEMORY_FORCE_PROXY: "1"\n')
+                connected = subprocess.run([args.node, str(cli), 'connect', 'hermes', '--no-guidelines', '--with-mcp'], cwd=out, env=env, text=True, capture_output=True, timeout=30)
+                (out / 'connect-mcp.log').write_text(connected.stdout + connected.stderr)
+                assert connected.returncode == 0 and 'mcp_servers:' in (hh / 'config.yaml').read_text()
+
             command = ['-m', 'hermes_cli.main', 'chat', '-q', 'Recall PREFETCH_HERON and save the requested fixture.', '-Q', '--toolsets', 'memory,skills,agentmemory' if mcp else 'memory', '--max-turns', '6']
             if mcp:
                 command += ['--skills', 'remember']

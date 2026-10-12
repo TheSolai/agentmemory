@@ -1,14 +1,15 @@
 """
 agentmemory memory provider for Hermes Agent.
 
-Drop this folder into ~/.hermes/plugins/agentmemory/
+Install the packaged provider with agentmemory connect hermes.
 
-Requires agentmemory server running: npx @agentmemory/agentmemory
+Requires a running AgentMemory server.
 """
 
 from __future__ import annotations
 
 import hashlib
+from contextvars import ContextVar
 import ipaddress
 import tempfile
 import json
@@ -28,7 +29,7 @@ def _resolve_project(cwd: str) -> str:
     """Canonical project scope, matching the hooks' resolveProject order:
     AGENTMEMORY_PROJECT_NAME env override, git repository basename, cwd basename.
     Keeps Hermes sessions in the same project bucket as every other agent."""
-    explicit = os.environ.get("AGENTMEMORY_PROJECT_NAME", "").strip()
+    explicit = (_environment_value("AGENTMEMORY_PROJECT_NAME") or "").strip()
     if explicit:
         return explicit
     try:
@@ -93,36 +94,6 @@ except ImportError:
 DEFAULT_BASE_URL = "http://localhost:3111"
 TIMEOUT = 5
 _plaintext_bearer_warned = False
-
-def _dotenv_values() -> dict[str, str]:
-    candidates = [Path.home() / ".agentmemory" / ".env"]
-    if os.environ.get("XDG_CONFIG_HOME"):
-        candidates.append(Path(os.environ["XDG_CONFIG_HOME"]) / "agentmemory" / ".env")
-    values: dict[str, str] = {}
-    for path in candidates:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            continue
-        for raw in lines:
-            line = raw.strip()
-            if line.startswith("export "):
-                line = line[7:].strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            value = value.strip()
-            if value[:1] in ("'", '\"'):
-                close = value.find(value[0], 1)
-                if close < 1:
-                    continue
-                value = value[1:close]
-            else:
-                value = value.split(" #", 1)[0].strip()
-            if key.strip() in ("AGENTMEMORY_URL", "AGENTMEMORY_SECRET"):
-                values.setdefault(key.strip(), value)
-    return values
-
 
 def _is_loopback(base: str) -> bool:
     if not _validate_url(base):
@@ -193,24 +164,11 @@ def _usable_secret(value: str | None) -> str:
     return trimmed
 
 
-def _read_agentmemory_file(name: str) -> str:
-    try:
-        return (Path.home() / ".agentmemory" / name).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
-
-
-def _stored_secret(base: str) -> str:
-    if not _is_loopback(base):
-        return ""
-    return _usable_secret(_dotenv_values().get("AGENTMEMORY_SECRET")) or _usable_secret(_read_agentmemory_file("secret"))
-
-
 def _environment_value(name: str) -> str | None:
     try:
         from agent.secret_scope import get_secret
-    except ImportError:
-        return os.environ.get(name)
+    except ImportError as error:
+        raise RuntimeError("Hermes scoped credential access is unavailable. Update Hermes before enabling AgentMemory.") from error
     return get_secret(name)
 
 
@@ -222,17 +180,24 @@ def _active_home() -> Path:
     return Path(get_hermes_home())
 
 
-def _routed_profile() -> bool:
+def _profile_home() -> Path:
+    home = _active_home().expanduser().resolve()
     try:
-        from agent import secret_scope
+        from agent.secret_scope import current_secret_scope_home, current_secret_scope, serves_routed_profile
     except ImportError:
-        return False
-    checker = getattr(secret_scope, "serves_routed_profile", secret_scope.is_multiplex_active)
-    return checker()
+        return home
+    if serves_routed_profile() and current_secret_scope() is None:
+        raise RuntimeError("AgentMemory requires the active Hermes profile secret scope.")
+    scoped_home = current_secret_scope_home()
+    if scoped_home and Path(scoped_home).expanduser().resolve() != home:
+        raise RuntimeError("AgentMemory profile home does not match the active secret scope.")
+    return home
 
 
 def _configuration(hermes_home: str | None = None) -> tuple[str, str]:
-    home = Path(hermes_home) if hermes_home else _active_home()
+    home = _profile_home()
+    if hermes_home and Path(hermes_home).expanduser().resolve() != home:
+        raise RuntimeError("AgentMemory profile changed. Restart this Hermes session before sending memory requests.")
     try:
         saved = json.loads((home / "agentmemory.json").read_text(encoding="utf-8"))
         if not isinstance(saved, dict):
@@ -242,16 +207,8 @@ def _configuration(hermes_home: str | None = None) -> tuple[str, str]:
     saved_url = saved.get("url")
     if not isinstance(saved_url, str):
         saved_url = ""
-    routed = _routed_profile()
-    dotenv_url = "" if routed else _dotenv_values().get("AGENTMEMORY_URL")
-    base = (_environment_value("AGENTMEMORY_URL") or saved_url or dotenv_url or DEFAULT_BASE_URL).rstrip("/")
-    secret = _usable_secret(_environment_value("AGENTMEMORY_SECRET"))
-    # A setup credential belongs to its saved endpoint, never to an environment URL override.
-    if not secret and base == (saved_url or DEFAULT_BASE_URL).rstrip("/"):
-        saved_secret = saved.get("secret")
-        if isinstance(saved_secret, str):
-            secret = _usable_secret(saved_secret)
-    return base, secret or ("" if routed else _stored_secret(base))
+    base = (_environment_value("AGENTMEMORY_URL") or saved_url or DEFAULT_BASE_URL).rstrip("/")
+    return base, _usable_secret(_environment_value("AGENTMEMORY_SECRET"))
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -266,7 +223,7 @@ def _api(base: str, path: str, body: dict | None = None, method: str = "POST", s
     if not _validate_url(base):
         return {"success": False, "errorCode": "invalid_url", "error": "Configure AGENTMEMORY_URL with an HTTP or HTTPS endpoint without credentials, query or fragment."}
     headers = {"Content-Type": "application/json"}
-    auth = (_usable_secret(_environment_value("AGENTMEMORY_SECRET")) or ("" if _routed_profile() else _stored_secret(base))) if secret is None else _usable_secret(secret)
+    auth = _usable_secret(_environment_value("AGENTMEMORY_SECRET")) if secret is None else _usable_secret(secret)
     _check_plaintext_bearer_guard(base, auth)
     if auth:
         headers["Authorization"] = f"Bearer {auth}"
@@ -306,35 +263,96 @@ class AgentMemoryProvider(MemoryProvider):
             _configuration()
         except RuntimeError as error:
             return str(error)
-        return "Set a valid AGENTMEMORY_URL or run hermes memory setup agentmemory."
+        return "Set a valid AGENTMEMORY_URL or run hermes memory setup."
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
-        self._hermes_home = Path(kwargs["hermes_home"]) if kwargs.get("hermes_home") else _active_home()
-        self._base, secret = _configuration(str(self._hermes_home))
-        self._session_id = session_id
-        self._cwd = kwargs.get("cwd") or os.getcwd()
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("AgentMemory requires a non-empty Hermes session ID.")
+        self._hermes_home = _profile_home()
+        self._base, secret = _configuration(kwargs.get("hermes_home"))
+        self._session_id = session_id.strip()
+        self._platform = kwargs.get("platform") or "cli"
+        self._local = self._platform in ("cli", "oneshot", "tui", "desktop", "acp")
+        self._cwd = kwargs.get("cwd")
+        if not self._cwd:
+            try:
+                from agent.runtime_cwd import scope_terminal_cwd
+                self._cwd = scope_terminal_cwd()
+            except ImportError:
+                pass
+        self._cwd = self._cwd or (os.getcwd() if self._local else str(self._hermes_home))
         self._project = _resolve_project(self._cwd)
+        self._explicit_agent = (_environment_value("AGENTMEMORY_AGENT_ID") or "").strip()
+        if self._explicit_agent == "*" or len(self._explicit_agent) > 128:
+            raise ValueError("AGENTMEMORY_AGENT_ID must be at most 128 characters and cannot be a wildcard.")
+        author = kwargs.get("user_id")
+        self._author = ContextVar("agentmemory_author", default=author.strip() if isinstance(author, str) else "")
+        self._writes_enabled = kwargs.get("agent_context", "primary") == "primary"
         self._write_lock = threading.RLock()
+        self._sessions: dict[str, str] = {}
         self._ended: set[str] = set()
         self._stopped = False
-        self._prefetched: tuple[str, str, str] | None = None
+        self._prefetched: tuple[str, str, str, str] | None = None
         _check_plaintext_bearer_guard(self._base, secret)
-        self._request("session/start", self._session_payload())
+        if self._agent_id and self._writes_enabled:
+            self._start_session()
 
-    def _session_payload(self) -> dict:
-        return {"sessionId": self._session_id, "project": self._project, "cwd": self._cwd}
+    @property
+    def _agent_id(self) -> str:
+        if self._explicit_agent:
+            return self._explicit_agent
+        author = self._author.get()
+        if not author and not self._local:
+            return ""
+        identity = [str(self._hermes_home), self._platform if author else "local", author]
+        return "hermes-" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
+
+    def _scoped_session_id(self, session_id: str | None = None) -> str:
+        identity = [str(self._hermes_home), self._agent_id, session_id or self._session_id]
+        return "hermes-" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def _session_payload(self, session_id: str | None = None) -> dict:
+        return {"sessionId": self._scoped_session_id(session_id), "project": self._project, "cwd": self._cwd, "agentId": self._agent_id}
+
+    def _start_session(self, session_id: str | None = None) -> None:
+        raw_id = session_id or self._session_id
+        scoped_id = self._scoped_session_id(raw_id)
+        if scoped_id in self._sessions and scoped_id not in self._ended:
+            return
+        result = self._request("session/start", self._session_payload(raw_id))
+        session = result.get("session")
+        if isinstance(session, dict) and session.get("id") == scoped_id:
+            self._sessions[scoped_id] = raw_id
+            self._ended.discard(scoped_id)
+
+    def _bound_configuration(self) -> tuple[str, str]:
+        base, secret = _configuration(str(self._hermes_home))
+        explicit_agent = (_environment_value("AGENTMEMORY_AGENT_ID") or "").strip()
+        if base != self._base or explicit_agent != self._explicit_agent:
+            raise RuntimeError("AgentMemory endpoint or identity changed. Restart this Hermes session before sending memory requests.")
+        if not self._agent_id:
+            raise RuntimeError("AgentMemory requires a message author for this gateway turn.")
+        return base, secret
 
     def _request(self, path: str, body: dict) -> dict:
-        if path in ("remember", "evolve", "observe", "session/start", "session/end"):
+        writing = path in ("remember", "evolve", "observe", "session/start", "session/end")
+        if writing:
             self._prefetched = None
-        base, secret = _configuration(str(self._hermes_home))
-        if base != self._base:
-            result = {"success": False, "errorCode": "configuration_changed", "error": "AgentMemory endpoint changed. Restart this Hermes session before sending memory requests."}
-        else:
+        try:
+            _, secret = self._bound_configuration()
+            if writing and (not self._writes_enabled or self._stopped):
+                return {"success": False, "errorCode": "read_only_context", "error": "AgentMemory writes are disabled outside the primary active session."}
             result = _api(self._base, path, body, secret=secret)
+        except RuntimeError as error:
+            result = {"success": False, "errorCode": "configuration_changed", "error": str(error)}
         if result.get("error"):
             print(f"agentmemory: {result['error']}", file=sys.stderr)
         return result
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
+        author = kwargs.get("author_id")
+        self._author.set(author.strip() if isinstance(author, str) else "")
+        self._prefetched = None
 
     def get_config_schema(self) -> list[dict]:
         return [
@@ -343,6 +361,12 @@ class AgentMemoryProvider(MemoryProvider):
                 "description": "agentmemory server URL",
                 "default": DEFAULT_BASE_URL,
                 "env_var": "AGENTMEMORY_URL",
+            },
+            {
+                "key": "project",
+                "description": "Project name (optional; defaults to the active workspace)",
+                "required": False,
+                "env_var": "AGENTMEMORY_PROJECT_NAME",
             },
             {
                 "key": "secret",
@@ -354,27 +378,27 @@ class AgentMemoryProvider(MemoryProvider):
         ]
 
     def save_config(self, values: dict, hermes_home: str) -> None:
+        saved = {"url": values["url"].rstrip("/")} if isinstance(values.get("url"), str) else {}
+        if "url" in saved and not _validate_url(saved["url"]):
+            raise ValueError("AgentMemory requires an HTTP or HTTPS URL without credentials, query or fragment.")
         config_path = Path(hermes_home) / "agentmemory.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        saved = {"url": values["url"]} if isinstance(values.get("url"), str) else {}
         config_path.write_text(json.dumps(saved, indent=2))
 
     def system_prompt_block(self) -> str:
-        result = self._request("context", {
-            "sessionId": self._session_id,
-            "project": self._project,
-        })
-        if result and result.get("context"):
-            return result["context"]
-        return ""
+        return "Use memory_recall to retrieve relevant saved context and memory_save to retain durable facts. Memory is scoped to this Hermes profile and author by default."
 
     def prefetch(self, query: str, **kwargs: Any) -> str:
         session_id = kwargs.get("session_id") or self._session_id
         cached = self._prefetched
         self._prefetched = None
-        if cached and cached[:2] == (session_id, query):
-            return cached[2]
-        result = self._request("smart-search", {"query": query, "limit": 5, "project": self._project})
+        if cached and cached[:3] == (session_id, self._agent_id, query):
+            try:
+                self._bound_configuration()
+                return cached[3]
+            except RuntimeError:
+                return ""
+        result = self._request("smart-search", {"query": query, "limit": 5, "project": self._project, "agentId": self._agent_id, "includeLessons": False})
         rows = result.get("results", [])
         if not isinstance(rows, list):
             return ""
@@ -388,7 +412,7 @@ class AgentMemoryProvider(MemoryProvider):
             if reference not in ids:
                 ids.append(reference)
         if ids:
-            expanded = self._request("smart-search", {"expandIds": ids, "project": self._project})
+            expanded = self._request("smart-search", {"expandIds": ids, "project": self._project, "agentId": self._agent_id})
             rows = expanded.get("results", [])
         if not isinstance(rows, list):
             return ""
@@ -407,7 +431,7 @@ class AgentMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query: str, **kwargs: Any) -> None:
         session_id = kwargs.get("session_id") or self._session_id
         context = self.prefetch(query, session_id=session_id)
-        self._prefetched = (session_id, query, context)
+        self._prefetched = (session_id, self._agent_id, query, context)
 
     def get_tool_schemas(self) -> list[dict]:
         return [
@@ -471,12 +495,14 @@ class AgentMemoryProvider(MemoryProvider):
         key = "content" if name == "memory_save" else "query"
         if not isinstance(args.get(key), str) or not args[key].strip():
             return json.dumps({"success": False, "error": f"{key} must be a non-empty string."})
-        payload = {key: args[key], "project": self._project}
+        payload = {key: args[key], "project": self._project, "agentId": self._agent_id}
         for field in ("project", "agentId"):
             if field in args:
                 if not isinstance(args[field], str) or not args[field].strip():
                     return json.dumps({"success": False, "error": f"{field} must be a non-empty string."})
                 payload[field] = args[field].strip()
+                if field == "agentId" and (payload[field] == "*" or len(payload[field]) > 128):
+                    return json.dumps({"success": False, "error": "agentId must be at most 128 characters and cannot be a wildcard."})
         if name == "memory_save":
             kind = args.get("type", "fact")
             if kind not in ("pattern", "preference", "architecture", "bug", "workflow", "fact"):
@@ -499,55 +525,62 @@ class AgentMemoryProvider(MemoryProvider):
                 if args["targetLayer"] not in ("all", "memory", "observation"):
                     return json.dumps({"success": False, "error": "Invalid targetLayer."})
                 payload["targetLayer"] = args["targetLayer"]
+            payload["includeLessons"] = False
             path = "search" if name == "memory_recall" else "smart-search"
         return json.dumps(self._request(path, payload))
 
     def sync_turn(self, user: str, assistant: str, **kwargs: Any) -> None:
-        # Hermes owns the serialized background worker and its shutdown barrier.
+        # Hermes owns the serialized background worker and its context propagation.
         with self._write_lock:
-            if self._stopped:
+            if self._stopped or not self._writes_enabled:
                 return
-            self._request("observe", {
-                "hookType": "post_tool_use",
-                "sessionId": kwargs.get("session_id") or self._session_id,
-                "project": self._project,
-                "cwd": self._cwd,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "data": {"tool_name": "conversation", "tool_input": user[:500], "tool_output": assistant[:2000]},
-            })
+            author = kwargs.get("turn_author")
+            token = None
+            if isinstance(author, dict):
+                author_id = author.get("id")
+                token = self._author.set(author_id.strip() if isinstance(author_id, str) else "")
+            try:
+                raw_id = kwargs.get("session_id") or self._session_id
+                self._start_session(raw_id)
+                self._request("observe", {
+                    **self._session_payload(raw_id),
+                    "hookType": "post_tool_use",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "data": {"tool_name": "conversation", "tool_input": user[:500], "tool_output": assistant[:2000]},
+                })
+            finally:
+                if token is not None:
+                    self._author.reset(token)
 
     def on_session_end(self, messages: list, **kwargs: Any) -> None:
         with self._write_lock:
-            session_id = kwargs.get("session_id") or self._session_id
-            if session_id in self._ended:
-                return
-            result = self._request("session/end", {"sessionId": session_id})
-            if result.get("success"):
-                self._ended.add(session_id)
+            raw_id = kwargs.get("session_id") or self._session_id
+            for scoped_id, session_id in list(self._sessions.items()):
+                if session_id != raw_id or scoped_id in self._ended:
+                    continue
+                result = self._request("session/end", {"sessionId": scoped_id})
+                if result.get("success"):
+                    self._ended.add(scoped_id)
 
     def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
         with self._write_lock:
             self._prefetched = None
-            if not new_session_id or new_session_id == self._session_id:
+            if not isinstance(new_session_id, str) or not new_session_id.strip() or new_session_id.strip() == self._session_id:
                 return
             self.on_session_end([])
-            self._session_id = new_session_id
+            self._session_id = new_session_id.strip()
             if kwargs.get("cwd"):
                 self._cwd = kwargs["cwd"]
                 self._project = _resolve_project(self._cwd)
-            self._ended.discard(new_session_id)
-            self._request("session/start", self._session_payload())
+            if self._agent_id and self._writes_enabled:
+                self._start_session()
 
     def on_pre_compress(self, messages: list, **kwargs: Any) -> str:
-        result = self._request("context", {
-            "sessionId": kwargs.get("session_id") or self._session_id,
-            "project": self._project,
-        })
-        context = result.get("context")
-        return context[:8000] if isinstance(context, str) else ""
+        query = " ".join(message["content"] for message in messages[-5:] if isinstance(message, dict) and isinstance(message.get("content"), str))
+        return self.prefetch(query[-2000:], **kwargs) if query.strip() else ""
 
     def _mirror_key(self, target: str, content: str) -> str:
-        scope = [self._base, self._project, str(self._hermes_home.resolve()), target, content]
+        scope = [self._base, self._project, self._agent_id, str(self._hermes_home), target, content]
         return hashlib.sha256(json.dumps(scope).encode()).hexdigest()
 
     def _write_mirrors(self, path: Path, records: dict[str, str]) -> None:
@@ -565,13 +598,16 @@ class AgentMemoryProvider(MemoryProvider):
     def on_memory_write(self, action: str, target: str, content: str, metadata: dict | None = None, **kwargs: Any) -> None:
         if action not in ("add", "update", "replace") or not isinstance(content, str) or not content.strip():
             return
+        if self._stopped or not self._writes_enabled:
+            return
         # Only IDs returned by this provider may be cleaned up after native replacement.
         try:
+            self._bound_configuration()
             import fcntl
             self._hermes_home.mkdir(parents=True, exist_ok=True)
             path = self._hermes_home / "agentmemory-mirrors.json"
             with self._write_lock, (self._hermes_home / "agentmemory-mirrors.lock").open("a") as lock:
-                if self._stopped:
+                if self._stopped or not self._writes_enabled:
                     return
                 deadline = time.monotonic() + TIMEOUT
                 while True:
@@ -601,12 +637,12 @@ class AgentMemoryProvider(MemoryProvider):
                             print("agentmemory: native replacement could not evolve its previous record; inspect the reported error before retrying.", file=sys.stderr)
                             return
                     else:
-                        result = self._request("remember", {"content": content, "type": "fact", "project": self._project})
+                        result = self._request("remember", {"content": content, "type": "fact", "project": self._project, "agentId": self._agent_id})
                     memory = result.get("memory", {})
                     if not result.get("success") or not isinstance(memory, dict):
                         return
                     new_id = memory.get("id")
-                    if not isinstance(new_id, str) or not new_id.startswith("mem_") or memory.get("content") != content or memory.get("project") != self._project:
+                    if not isinstance(new_id, str) or not new_id.startswith("mem_") or memory.get("content") != content or memory.get("project") != self._project or memory.get("agentId") != self._agent_id:
                         print("agentmemory: native mirror write did not establish record ownership; replacement tracking was not updated.", file=sys.stderr)
                         return
                     new_key = self._mirror_key(target, content)
@@ -618,7 +654,7 @@ class AgentMemoryProvider(MemoryProvider):
                         print("agentmemory: native replacement saved; previous record ownership is unavailable, so the previous record could not be superseded.", file=sys.stderr)
                 finally:
                     fcntl.flock(lock, fcntl.LOCK_UN)
-        except (ImportError, OSError, ValueError) as error:
+        except (ImportError, OSError, ValueError, RuntimeError) as error:
             print(f"agentmemory: native memory mirroring could not complete ({type(error).__name__}); check the active Hermes home and retry.", file=sys.stderr)
 
     def shutdown(self, **kwargs: Any) -> None:

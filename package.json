@@ -43,7 +43,9 @@
     "eval:coding-life": "node --import tsx eval/runner/coding-life.ts",
     "eval:lifecycle": "node --import tsx eval/runner/lifecycle.ts",
     "eval:recall": "node --import tsx eval/runner/recall-quality.ts",
-    "eval:check": "tsc --noEmit --project tsconfig.eval.json && vitest run test/eval-adapters.test.ts test/eval-integrity.test.ts"
+    "eval:check": "tsc --noEmit --project tsconfig.eval.json && vitest run test/eval-adapters.test.ts test/eval-integrity.test.ts",
+    "prepack": "node scripts/plugins/prepare-native.mjs",
+    "plugin:pack:openclaw": "node scripts/plugins/prepare-native.mjs && mkdir -p dist/plugins && npm pack ./integrations/openclaw --pack-destination dist/plugins"
   },
   "keywords": [
     "ai",
@@ -58,6 +60,7 @@
   ],
   "files": [
     "dist/",
+    "!dist/plugins/**",
     "plugin/",
     "integrations/pi/",
     "integrations/hermes/",
@@ -84,7 +87,9 @@
     "@iii-dev/helpers": "0.22.1",
     "iii-sdk": "0.22.1",
     "picocolors": "^1.1.1",
-    "zod": "^4.0.0"
+    "zod": "^4.0.0",
+    "yaml": "^2.8.1",
+    "json5": "^2.2.3"
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^4.2.0",

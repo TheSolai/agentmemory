@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 type Capability = {
@@ -23,6 +25,12 @@ function makeApi(overrides: Partial<FakeApi> = {}): FakeApi {
     logger: { warn: vi.fn() },
     ...overrides,
   };
+}
+
+function successfulResponse(url: unknown, init?: RequestInit): Response {
+  return new Response(JSON.stringify(String(url).endsWith("session/start")
+    ? { session: { id: JSON.parse(String(init?.body)).sessionId }, context: {} }
+    : { success: true, results: [] }));
 }
 
 describe("openclaw plugin — memory capability registration", () => {
@@ -68,7 +76,7 @@ describe("OpenClaw native conversation contract", () => {
     const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       calls.push({ path: String(url), body: JSON.parse(String(init?.body)) });
-      return new Response(JSON.stringify({ success: true }), { status: 200 });
+      return successfulResponse(url, init);
     });
     try {
       plugin.register(api);
@@ -77,8 +85,8 @@ describe("OpenClaw native conversation contract", () => {
         { role: "user", content: "Ship the fix" },
         { role: "assistant", content: [{ type: "text", text: "Verified the fix" }] },
       ] }, { sessionId: "native-session", workspaceDir: "/workspace/service", agentId: "reviewer", runId: "native-run" });
-      expect(calls[0]).toMatchObject({ path: "http://localhost:3111/agentmemory/session/start", body: { sessionId: "native-session", project: "service", cwd: "/workspace/service", agentId: "reviewer" } });
-      expect(calls[1]).toMatchObject({ path: "http://localhost:3111/agentmemory/observe", body: { sessionId: "native-session", project: "service", cwd: "/workspace/service", eventId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), data: { tool_name: "conversation", tool_input: "Ship the fix", tool_output: "Verified the fix" } } });
+      expect(calls[0]).toMatchObject({ path: "http://localhost:3111/agentmemory/session/start", body: { sessionId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), project: "service", cwd: "/workspace/service", agentId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/) } });
+      expect(calls[1]).toMatchObject({ path: "http://localhost:3111/agentmemory/observe", body: { sessionId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), project: "service", cwd: "/workspace/service", eventId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), data: { tool_name: "conversation", tool_input: "Ship the fix", tool_output: "Verified the fix" } } });
     } finally { fetchMock.mockRestore(); }
   });
 });
@@ -99,8 +107,8 @@ describe("OpenClaw native recall", () => {
       expect(handler).toBeTypeOf("function");
       const result = await handler({ prompt: "How do we deploy?" }, { sessionId: "session-1", workspaceDir: "/work/service", agentId: "reviewer" });
       expect(requests).toEqual([
-        { query: "How do we deploy?", limit: 5, includeLessons: false, project: "service", agentId: "reviewer", sessionId: "session-1", source: "openclaw" },
-        { expandIds: [{ obsId: "memory-1", sessionId: "memory" }], project: "service", agentId: "reviewer", sessionId: "session-1", source: "openclaw" },
+        { query: "How do we deploy?", limit: 5, includeLessons: false, project: "service", agentId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), sessionId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), source: "openclaw" },
+        { expandIds: [{ obsId: "memory-1", sessionId: "memory" }], project: "service", agentId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), sessionId: expect.stringMatching(/^openclaw-[a-f0-9]{64}$/), source: "openclaw" },
       ]);
       expect(result.prependContext).toContain("COBALT-9271");
     } finally { fetchMock.mockRestore(); }
@@ -160,10 +168,10 @@ describe("OpenClaw capture edge cases", () => {
   async function exercise(events: unknown[], config: Record<string, unknown> = {}, responses: Array<Response | Error> = []) {
     const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
     const api = makeApi({ pluginConfig: config });
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const response = responses.shift();
       if (response instanceof Error) throw response;
-      return response ?? new Response('{"success":true}');
+      return response ?? successfulResponse(url, init);
     });
     try {
       plugin.register(api);
@@ -189,12 +197,20 @@ describe("OpenClaw capture edge cases", () => {
     const result = await exercise([event, event]);
     expect(result.calls).toHaveLength(3);
     expect(result.calls[1].body.eventId).toBe(result.calls[2].body.eventId);
-    expect(result.calls[1].body.sessionId).toBe("native-key");
+    expect(result.calls[1].body.sessionId).toMatch(/^openclaw-[a-f0-9]{64}$/);
   });
   it("retries session startup after a failed request instead of capturing under an unbound agent", async () => {
     const event = { success: true, messages };
     const result = await exercise([event, event], {}, [new Response("unauthorized", { status: 401 })]);
     expect(result.calls.map((call) => call.url.split("/agentmemory/")[1])).toEqual(["session/start", "session/start", "observe"]);
+  });
+  it.each([{ success: true }, { session: {} }, { session: { id: "foreign-session" } }, { session: { id: null } }])("rejects an unconfirmed session response %j and retries before capturing", async (response) => {
+    const event = { success: true, messages };
+    const result = await exercise([event, event], {}, [new Response(JSON.stringify(response))]);
+    expect(result.calls.map((call) => call.url.split("/agentmemory/")[1])).toEqual(["session/start", "session/start", "observe"]);
+    expect(result.calls[0].body.sessionId).toBe(result.calls[1].body.sessionId);
+    expect(result.calls[2].body.sessionId).toBe(result.calls[1].body.sessionId);
+    expect(result.warnings).toEqual([["agentmemory: capture skipped because session startup did not confirm the requested session"]]);
   });
   it("sends explicit auth and refuses redirects", async () => {
     vi.stubEnv("AGENTMEMORY_SECRET", "synthetic-token");
@@ -215,10 +231,10 @@ describe("OpenClaw session finalization", () => {
     let release!: () => void;
     const held = new Promise<void>((done) => { release = done; });
     const paths: string[] = [];
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       paths.push(String(url).split("/agentmemory/")[1]);
       if (String(url).endsWith("observe")) await held;
-      return new Response('{"success":true}');
+      return successfulResponse(url, init);
     });
     try {
       plugin.register(api);
@@ -274,7 +290,7 @@ describe("OpenClaw key-only session lifecycle", () => {
     const requests: Array<{ path: string; sessionId: string }> = [];
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       requests.push({ path: String(url).split("/agentmemory/")[1], sessionId: JSON.parse(String(init?.body)).sessionId });
-      return new Response('{"success":true}');
+      return successfulResponse(url, init);
     });
     try {
       plugin.register(api);
@@ -282,7 +298,106 @@ describe("OpenClaw key-only session lifecycle", () => {
       const end = api.on.mock.calls.find(([name]) => name === "session_end")?.[1];
       await capture({ success: true, messages: [{ role: "user", content: "request" }, { role: "assistant", content: "reply" }] }, { sessionKey: "agent:main:current", workspaceDir: "/project" });
       await end({ sessionId: "native-uuid", sessionKey: "agent:main:current" }, { sessionId: "native-uuid", sessionKey: "agent:main:current" });
-      expect(requests.map((request) => request.sessionId)).toEqual(["agent:main:current", "agent:main:current", "agent:main:current"]);
+      expect(requests).toHaveLength(3);
+      expect(new Set(requests.map((request) => request.sessionId)).size).toBe(1);
+      expect(requests[0].sessionId).toMatch(/^openclaw-[a-f0-9]{64}$/);
     } finally { fetchMock.mockRestore(); }
+  });
+});
+
+describe("OpenClaw profile and credential isolation", () => {
+  it("keeps identical native sessions separate across profiles and stable after re-registration", async () => {
+    const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
+    const calls: Array<{ url: string; body: any; auth?: string }> = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)), auth: (init?.headers as any).Authorization });
+      return successfulResponse(url, init);
+    });
+    const create = (profile: string, endpoint: string, secret_env: string) => {
+      const api = makeApi({ pluginConfig: { base_url: endpoint, secret_env } });
+      plugin.register({ ...api, runtime: { state: { resolveStateDir: () => profile } } });
+      return (name: string) => api.on.mock.calls.find(([event]) => event === name)?.[1];
+    };
+    const ctx = { sessionId: "same-session", workspaceDir: "/shared/workspace", agentId: "main" };
+    const event = { success: true, messages: [{ role: "user", content: "private fact" }, { role: "assistant", content: "saved fact" }] };
+    vi.stubEnv("PROFILE_A_KEY", "key-a"); vi.stubEnv("PROFILE_B_KEY", "key-b");
+    try {
+      const a = create("/profiles/a", "https://a.example.test", "PROFILE_A_KEY");
+      const b = create("/profiles/b", "https://b.example.test", "PROFILE_B_KEY");
+      await Promise.all([a("agent_end")(event, ctx), b("agent_end")(event, ctx)]);
+      const writes = calls.filter((call) => call.url.endsWith("observe"));
+      expect(writes).toHaveLength(2);
+      expect(writes[0].body.agentId).not.toBe(writes[1].body.agentId);
+      expect(writes[0].body.sessionId).not.toBe(writes[1].body.sessionId);
+      expect(calls.filter((call) => call.url.startsWith("https://a.")).every((call) => call.auth === "Bearer key-a")).toBe(true);
+      expect(calls.filter((call) => call.url.startsWith("https://b.")).every((call) => call.auth === "Bearer key-b")).toBe(true);
+      const restarted = create("/profiles/a", "https://a.example.test", "PROFILE_A_KEY");
+      await restarted("before_prompt_build")({ prompt: "recall" }, { ...ctx, sessionId: "new-session" });
+      expect(calls.at(-1)?.body.agentId).toBe(writes[0].body.agentId);
+      expect(calls.at(-1)?.body.sessionId).not.toBe(writes[0].body.sessionId);
+      vi.stubEnv("PROFILE_A_KEY", "rotated-a");
+      await a("before_prompt_build")({ prompt: "recall" }, ctx);
+      expect(calls.at(-1)?.auth).toBe("Bearer rotated-a");
+      vi.stubEnv("PROFILE_A_KEY", "${PROFILE_A_KEY}");
+      vi.stubEnv("AGENTMEMORY_SECRET", "unrelated-default");
+      await a("before_prompt_build")({ prompt: "recall" }, ctx);
+      expect(calls.at(-1)?.auth).toBeUndefined();
+    } finally { fetchMock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("refuses a changed environment endpoint before sending a rotated credential", async () => {
+    const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
+    vi.stubEnv("AGENTMEMORY_URL", "https://first.example.test");
+    const api = makeApi({ pluginConfig: {} });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response('{"results":[]}'));
+    try {
+      plugin.register(api);
+      vi.stubEnv("AGENTMEMORY_URL", "https://second.example.test");
+      vi.stubEnv("AGENTMEMORY_SECRET", "second-endpoint-key");
+      const recall = api.on.mock.calls.find(([name]) => name === "before_prompt_build")?.[1];
+      await expect(recall({ prompt: "query" }, { sessionId: "s", workspaceDir: "/workspace" })).rejects.toThrow(/endpoint or credential configuration changed/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally { fetchMock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("normalizes tilde profile paths consistently when the host state helper is unavailable", async () => {
+    const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
+    const agents: string[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      agents.push(JSON.parse(String(init?.body)).agentId);
+      return new Response('{"results":[]}');
+    });
+    try {
+      vi.stubEnv("OPENCLAW_HOME", "");
+      for (const state of ["~/.openclaw-profile-a", join(homedir(), ".openclaw-profile-a")]) {
+        vi.stubEnv("OPENCLAW_STATE_DIR", state);
+        const api = makeApi(); plugin.register(api);
+        await api.on.mock.calls.find(([name]) => name === "before_prompt_build")?.[1]({ prompt: "query" }, { sessionId: "s", workspaceDir: "/workspace" });
+      }
+      expect(agents).toHaveLength(2); expect(agents[0]).toBe(agents[1]);
+    } finally { fetchMock.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("retains pending session starts across cache eviction", async () => {
+    const { default: plugin } = await import("../integrations/openclaw/plugin.mjs");
+    const api = makeApi();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const observed = new Set<string>();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (String(url).endsWith("session/start")) await held;
+      if (String(url).endsWith("observe")) observed.add(JSON.parse(String(init?.body)).sessionId);
+      return successfulResponse(url, init);
+    });
+    try {
+      plugin.register(api);
+      const capture = api.on.mock.calls.find(([name]) => name === "agent_end")?.[1];
+      const tasks = Array.from({ length: 257 }, (_, i) => capture({ success: true, messages: [
+        { role: "user", content: "request" }, { role: "assistant", content: "answer" },
+      ] }, { sessionId: `session-${i}`, workspaceDir: "/workspace", agentId: "main" }));
+      expect(observed.size).toBe(0);
+      release(); await Promise.all(tasks);
+      expect(observed.size).toBe(257);
+    } finally { release(); fetchMock.mockRestore(); }
   });
 });

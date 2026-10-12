@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -58,7 +58,7 @@ const modelEvents = join(root, "model-events.jsonl");
 const transportEvents = join(root, "transport-events.jsonl");
 const transportObserver = join(privateRoot, "transport-observer.mjs");
 const baseEnv = (dir) => ({ HOME: dir, USERPROFILE: dir, PATH: `${dirname(options.node)}:/opt/homebrew/bin:/usr/bin:/bin`, TMPDIR: join(root, "tmp"), NO_COLOR: "1", CI: "1" });
-const env = { ...baseEnv(home), OPENCLAW_HOME: home, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: join(state, "openclaw.json"), CODEX_HOME: join(home, "empty-codex"), AGENTMEMORY_PROJECT_NAME: project };
+const env = { ...baseEnv(home), OPENCLAW_HOME: home, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: join(state, "openclaw.json"), CODEX_HOME: join(home, "empty-codex"), AGENTMEMORY_PROJECT_NAME: project, AGENTMEMORY_SECRET: backendSecret };
 function kill(pid) { try { process.kill(-pid, "SIGKILL"); } catch {} try { process.kill(pid, "SIGKILL"); } catch {} }
 process.on("exit", () => { for (const pid of children) kill(pid); rmSync(privateRoot, { recursive: true, force: true }); });
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => process.exit(130));
@@ -114,10 +114,10 @@ async function check(name, fn) {
 }
 const readJsonLines = (path) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 const readEvents = () => readJsonLines(modelEvents);
-async function turn(name, prompt) {
+async function turn(name, prompt, runEnv = env) {
   scenario = name; const start = wire.length; const eventStart = readEvents().length; const transportStart = readJsonLines(transportEvents).length;
   const sessionId = `${project}-${name}`;
-  const result = await run([options["openclaw-cli"], "agent", "--local", "--agent", "main", "--session-id", sessionId, "--message", prompt, "--json", "--thinking", "low", "--timeout", "90"], { ...env, NODE_OPTIONS: `--import=${transportObserver}` }, home, name);
+  const result = await run([options["openclaw-cli"], "agent", "--local", "--agent", "main", "--session-id", sessionId, "--message", prompt, "--json", "--thinking", "low", "--timeout", "90"], { ...runEnv, NODE_OPTIONS: `--import=${transportObserver}` }, home, name);
   assert.equal(result.code, 0, result.output.slice(-1800));
   const events = readEvents().slice(eventStart);
   const inputs = events.filter((item) => item.name === "llm_input");
@@ -134,9 +134,9 @@ async function turn(name, prompt) {
   for (const value of [phrase, window, decoyProject, decoyAgent]) assert(!JSON.stringify(inputs.map((item) => item.historyMessages)).includes(value), "Fresh session leaked a withheld value through history");
   const captured = wire.slice(start).find((item) => item.path.endsWith("/observe") && item.status === 201);
   assert(captured, "Completed real model turn was not automatically captured");
-  assert.equal(captured.body.sessionId, sessionId); assert.equal(captured.body.project, project); assert.equal(captured.body.cwd, workspace);
+  assert(captured.body.sessionId && captured.body.agentId, "Native capture must carry a scoped session and agent identity"); assert.equal(captured.body.project, project); assert.equal(captured.body.cwd, workspace);
   let observations;
-  await waitFor(async () => { observations = await backend(`observations?sessionId=${encodeURIComponent(sessionId)}`, undefined, "GET"); return observations.observations?.some((item) => item.id === captured.response.observationId && item.agentId === "main"); });
+  await waitFor(async () => { observations = await backend(`observations?sessionId=${encodeURIComponent(captured.body.sessionId)}`, undefined, "GET"); return observations.observations?.some((item) => item.id === captured.response.observationId && item.agentId === captured.body.agentId); });
   writeFileSync(join(root, `${name}-observations.json`), JSON.stringify(observations, null, 2));
   writeFileSync(join(root, `${name}-answer.txt`), answer + "\n");
   return { events, inputs, answer, captured, calls: wire.slice(start) };
@@ -174,28 +174,48 @@ globalThis.fetch=async(input,init)=>{
     wire.push(item); appendFileSync(join(root, "backend-wire.jsonl"), JSON.stringify(item) + "\n");
   } }));
   await new Promise((done) => proxy.listen(0, "127.0.0.1", done)); ports.push(proxy.address().port);
-  cpSync(plugin, join(state, "extensions/agentmemory"), { recursive: true });
+  const connectorEnv = { ...env, AGENTMEMORY_URL: `http://127.0.0.1:${proxy.address().port}`, AGENTMEMORY_SECRET: backendSecret };
+  await check("packaged connector installs native plugin and skills idempotently", async () => {
+    const before = readFileSync(env.OPENCLAW_CONFIG_PATH, "utf8");
+    const dry = await run([cli, "connect", "openclaw", "--no-guidelines", "--dry-run"], connectorEnv, home, "connect-dry");
+    assert.equal(dry.code, 0, dry.output);
+    assert.equal(readFileSync(env.OPENCLAW_CONFIG_PATH, "utf8"), before);
+    assert(!existsSync(join(state, "extensions/agentmemory")));
+    const connected = await run([cli, "connect", "openclaw", "--no-guidelines"], connectorEnv, home, "connect");
+    assert.equal(connected.code, 0, connected.output);
+    assert.equal(hash(join(state, "extensions/agentmemory/plugin.mjs")), hash(join(plugin, "plugin.mjs")));
+    assert(existsSync(join(state, "extensions/agentmemory/skills/remember/SKILL.md")));
+    const installed = readFileSync(env.OPENCLAW_CONFIG_PATH, "utf8");
+    assert(!installed.includes(backendSecret), "Connector embedded backend credentials in native config");
+    assert.equal(JSON.parse(installed).agents.defaults.model.primary, options.model);
+    const repeated = await run([cli, "connect", "openclaw", "--no-guidelines"], connectorEnv, home, "connect-repeat");
+    assert.equal(repeated.code, 0, repeated.output);
+    assert.equal(readFileSync(env.OPENCLAW_CONFIG_PATH, "utf8"), installed);
+  });
   const recorder = join(state, "extensions/agentmemory-live-recorder"); mkdirSync(recorder, { recursive: true });
   writeFileSync(join(recorder, "package.json"), JSON.stringify({ name: "agentmemory-live-recorder", version: "0.0.0", type: "module", openclaw: { extensions: ["./plugin.mjs"] } }));
   writeFileSync(join(recorder, "openclaw.plugin.json"), JSON.stringify({ id: "agentmemory-live-recorder", name: "Live test observation", configSchema: { type: "object", additionalProperties: false } }));
   writeFileSync(join(recorder, "plugin.mjs"), `import {appendFileSync,readFileSync,existsSync} from 'node:fs';\nconst path=${JSON.stringify(modelEvents)};\nexport default {id:'agentmemory-live-recorder',register(api){for(const name of ['llm_input','llm_output','model_call_ended'])api.on(name,event=>{const {runId,sessionId,provider,model,systemPrompt,prompt,historyMessages,assistantTexts,usage,outcome,api:protocol}=event;appendFileSync(path,JSON.stringify({name,runId,sessionId,provider,model,systemPrompt,prompt,historyMessages,assistantTexts,usage,outcome,api:protocol})+'\\n');if(name==='llm_input'&&readFileSync(path,'utf8').split('\\n').filter(line=>line.includes('"name":"llm_input"')).length>6)process.exit(97);});}};\n`);
-  mkdirSync(join(home, ".agentmemory"), { recursive: true }); writeFileSync(join(home, ".agentmemory/secret"), backendSecret, { mode: 0o600 });
   writeFileSync(join(workspace, "AGENTS.md"), "This is an isolated synthetic memory test. Give concise answers based on the user's current message and recalled context. Do not access tools or files.\n");
   const config = JSON.parse(readFileSync(env.OPENCLAW_CONFIG_PATH, "utf8"));
   config.agents.defaults.skipBootstrap = true;
   config.agents.defaults.models[options.model].params = { transport: "sse" };
   config.auth = { order: { openai: ["openai:live"] } };
-  config.plugins = { allow: ["openai", "agentmemory", "agentmemory-live-recorder"], slots: { memory: "agentmemory" }, entries: { openai: { enabled: true }, agentmemory: { enabled: true, hooks: { allowConversationAccess: true }, config: { base_url: `http://127.0.0.1:${proxy.address().port}` } }, "agentmemory-live-recorder": { enabled: true, hooks: { allowConversationAccess: true } } } };
+  config.plugins.allow = [...new Set([...(config.plugins.allow || []), "agentmemory", "openai", "agentmemory-live-recorder"])];
+  config.plugins.entries.openai = { enabled: true };
+  config.plugins.entries["agentmemory-live-recorder"] = { enabled: true, hooks: { allowConversationAccess: true } };
+  config.plugins.entries.agentmemory.config = { ...config.plugins.entries.agentmemory.config, base_url: `http://127.0.0.1:${proxy.address().port}` };
+  delete config.mcp;
   writeFileSync(env.OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2));
   const validated = await run([options["openclaw-cli"], "config", "validate", "--json"], env, home, "config-validate");
   assert.equal(validated.code, 0, validated.output.slice(-1500));
-  await backend("remember", { content: `${topic}: launch phrase ${decoyProject}; maintenance window WRONG-PROJECT.`, type: "fact", project: `${project}-foreign`, agentId: "main" });
-  await backend("remember", { content: `${topic}: launch phrase ${decoyAgent}; maintenance window WRONG-AGENT.`, type: "fact", project, agentId: "other-agent" });
   await check("real conversation automatically captures synthetic decision", async () => {
     const result = await turn("capture", `For the ${topic}, we decided the exact launch phrase is ${phrase} and the maintenance window identifier is ${window}. Please acknowledge by repeating these two values in one sentence.`);
     assert(result.answer.includes(phrase) && result.answer.includes(window), "Real model acknowledgement omitted the synthetic facts");
     assert(JSON.stringify(result.captured.body).includes(phrase) && JSON.stringify(result.captured.body).includes(window));
     sourceObservationId = result.captured.response.observationId;
+    await backend("remember", { content: `${topic}: launch phrase ${decoyProject}; maintenance window WRONG-PROJECT.`, type: "fact", project: `${project}-foreign`, agentId: result.captured.body.agentId });
+    await backend("remember", { content: `${topic}: launch phrase ${decoyAgent}; maintenance window WRONG-AGENT.`, type: "fact", project, agentId: "other-agent" });
     return { sourceObservationId, model: result.inputs[0].model, provider: result.inputs[0].provider };
   });
   const recallPrompt = `For the ${topic}, what exact launch phrase and maintenance window identifier did we decide? Use the recalled decision, answer in one sentence, and say unknown if no decision is available.`;
@@ -212,6 +232,38 @@ globalThis.fetch=async(input,init)=>{
   await check("fresh session recalls captured facts without history or scoped decoys", () => verifyRecall("fresh-recall"));
   await stopBackend(); await startBackend();
   await check("fresh session recalls the original captured observation after daemon restart", () => verifyRecall("restart-recall"));
+  await check("separate profile in the same workspace excludes another profile's memory", async () => {
+    const otherState = join(home, ".openclaw-foreign"); mkdirSync(otherState, { recursive: true });
+    const otherEnv = { ...connectorEnv, OPENCLAW_STATE_DIR: otherState, OPENCLAW_CONFIG_PATH: join(otherState, "openclaw.json") };
+    const otherConfig = structuredClone(config);
+    delete otherConfig.plugins; delete otherConfig.skills;
+    writeFileSync(otherEnv.OPENCLAW_CONFIG_PATH, JSON.stringify(otherConfig, null, 2));
+    const otherAgent = join(otherState, "agents/main/agent"); mkdirSync(otherAgent, { recursive: true });
+    writeFileSync(join(otherAgent, "auth-profiles.json"), JSON.stringify({ version: 1, profiles: { "openai:live": { type: "oauth", provider: "openai", access, refresh: "", expires: claims.exp * 1000, accountId: sourceAuth.tokens.account_id } } }), { mode: 0o600 });
+    const imported = await run([options["openclaw-cli"], "doctor", "--fix", "--yes", "--non-interactive"], otherEnv, home, "foreign-auth-import");
+    assert.equal(imported.code, 0, imported.output);
+    assert(imported.output.includes("Migrated auth profile JSON"));
+    const connected = await run([cli, "connect", "openclaw", "--no-guidelines"], otherEnv, home, "foreign-connect");
+    assert.equal(connected.code, 0, connected.output);
+    const installed = JSON.parse(readFileSync(otherEnv.OPENCLAW_CONFIG_PATH, "utf8"));
+    installed.plugins.allow = [...new Set([...(installed.plugins.allow || []), "agentmemory", "openai", "agentmemory-live-recorder"])];
+    installed.plugins.entries.openai = { enabled: true };
+    installed.plugins.entries["agentmemory-live-recorder"] = config.plugins.entries["agentmemory-live-recorder"];
+    installed.plugins.load = { paths: [recorder] };
+    installed.plugins.entries.agentmemory.config = { base_url: `http://127.0.0.1:${proxy.address().port}` };
+    delete installed.mcp;
+    writeFileSync(otherEnv.OPENCLAW_CONFIG_PATH, JSON.stringify(installed, null, 2));
+    const answer = await turn("foreign-profile", recallPrompt, otherEnv);
+    assert(/unknown/i.test(answer.answer), "Foreign profile did not report missing memory");
+    for (const value of [phrase, window, decoyProject, decoyAgent]) {
+      assert(!JSON.stringify(answer.inputs).includes(value), "Foreign profile received another profile's evidence");
+      assert(!answer.answer.includes(value), "Foreign profile answered with another profile's evidence");
+    }
+    const ownCapture = wire.find((item) => item.scenario === "capture" && item.path.endsWith("/observe") && item.status === 201);
+    assert.notEqual(answer.captured.body.agentId, ownCapture.body.agentId);
+    return { profileAgentIdsDistinct: true, sharedWorkspace: true };
+  });
+  await check("primary profile still recalls its facts after a foreign profile turn", () => verifyRecall("primary-after-foreign"));
 } catch (error) {
   if (!checks.some((item) => !item.success)) checks.push({ name: "gate setup", success: false, error: redact(error.message) });
 } finally {
@@ -223,7 +275,7 @@ globalThis.fetch=async(input,init)=>{
   rmSync(privateRoot, { recursive: true, force: true });
   checks.push({ name: "temporary credentials removed", success: !existsSync(privateRoot) });
   checks.push({ name: "all owned ports closed", success: (await Promise.all(ports.map(portFree))).every(Boolean) });
-  const summary = { hostVersion, node: process.version, requestedModel: options.model, packageHashes, checks, passed: checks.filter((item) => item.success).length, failed: checks.filter((item) => !item.success).length, logicalModelCalls: readEvents().filter((item) => item.name === "llm_input").length, httpModelRequests: readJsonLines(transportEvents).filter((item) => item.event === "request").length, coverage: "Real native OpenAI OAuth model conversations; automatic capture and scoped fresh-session recall. No channels, personal transcripts, refresh-token use or external messages." };
+  const summary = { hostVersion, node: process.version, requestedModel: options.model, packageHashes, checks, passed: checks.filter((item) => item.success).length, failed: checks.filter((item) => !item.success).length, logicalModelCalls: readEvents().filter((item) => item.name === "llm_input").length, httpModelRequests: readJsonLines(transportEvents).filter((item) => item.event === "request").length, coverage: "Real native OpenAI OAuth model conversations; packaged connector setup, automatic capture, profile isolation and scoped fresh-session recall. No channels, personal transcripts, refresh-token use or external messages." };
   writeFileSync(join(root, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
   console.log(JSON.stringify({ passed: summary.passed, failed: summary.failed, logicalModelCalls: summary.logicalModelCalls, httpModelRequests: summary.httpModelRequests }));
   process.exitCode = summary.failed ? 1 : 0;

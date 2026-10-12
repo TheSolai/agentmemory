@@ -21,11 +21,16 @@ describe("OpenClaw connector", () => {
     const existing = { agents: { defaults: { workspace: "/custom" } }, mcp: { servers: { other: { command: "custom" } } } };
     writeFileSync(path, JSON.stringify(existing));
     const { adapter } = await import("../src/cli/connect/openclaw.js");
-    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    expect((await adapter.install({ dryRun: false, force: false, withMcp: true })).kind).toBe("installed");
     const text = readFileSync(path, "utf8"); const config = JSON.parse(text);
     expect(config.agents).toEqual(existing.agents);
     expect(config.mcp.servers.other).toEqual({ command: "custom" });
-    expect(config.mcp.servers.agentmemory).toEqual({ command: "npx", args: ["-y", "@agentmemory/mcp"], transport: "stdio", env: { AGENTMEMORY_TOOLS: "all", AGENTMEMORY_FORCE_PROXY: "1" } });
+    expect(config.mcp.servers.agentmemory).toMatchObject({ command: process.execPath, transport: "stdio", env: { AGENTMEMORY_TOOLS: "all", AGENTMEMORY_FORCE_PROXY: "1" } });
+    expect(config.mcp.servers.agentmemory.args[0]).toMatch(/dist[/\\]standalone\.mjs$/);
+    expect(config.plugins.slots.memory).toBe("agentmemory");
+    expect(config.plugins.entries.agentmemory.hooks.allowConversationAccess).toBe(true);
+    expect(existsSync(join(home, ".openclaw/extensions/agentmemory/plugin.mjs"))).toBe(true);
+    expect(existsSync(join(home, ".openclaw/extensions/agentmemory/skills/remember/SKILL.md"))).toBe(true);
     expect(config.mcpServers).toBeUndefined();
     expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("already-wired");
     expect(readFileSync(path, "utf8")).toBe(text);
@@ -65,9 +70,9 @@ describe("OpenClaw connector", () => {
     writeFileSync(path, raw);
     const { adapter } = await import("../src/cli/connect/openclaw.js");
     await adapter.install({ dryRun: false, force: false });
-    expect(readFileSync(path, "utf8")).toBe(raw);
-    await adapter.install({ dryRun: false, force: true });
-    expect(JSON.parse(readFileSync(path, "utf8")).mcp.servers.agentmemory.command).toBe("npx");
+    expect(JSON.parse(readFileSync(path, "utf8")).mcp.servers.agentmemory).toEqual({ command: "custom", env: { CUSTOM: "yes" } });
+    await adapter.install({ dryRun: false, force: true, withMcp: true });
+    expect(JSON.parse(readFileSync(path, "utf8")).mcp.servers.agentmemory.command).toBe(process.execPath);
   });
 
   it("targets the native custom state directory", async () => {
@@ -90,6 +95,71 @@ describe("OpenClaw connector", () => {
     writeFileSync(path, '{"mcp":{"servers":{"agentmemory":null}}}');
     const { adapter } = await import("../src/cli/connect/openclaw.js");
     expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("skipped");
+    expect((await adapter.install({ dryRun: false, force: true })).kind).toBe("skipped");
+    expect((await adapter.install({ dryRun: false, force: true, withMcp: true })).kind).toBe("installed");
+  });
+
+  it("installs native capture without silently enabling the shared MCP surface", async () => {
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    await adapter.install({ dryRun: false, force: false });
+    expect(JSON.parse(readFileSync(path, "utf8")).mcp).toBeUndefined();
+  });
+  it("preserves custom JSON5 values and existing plugin permissions", async () => {
+    writeFileSync(path, `{ agents: { defaults: { workspace: '/custom', }, }, plugins: { allow: ['other'], entries: { other: { enabled: true } } }, skills: { load: { extraDirs: ['/custom-skills'] } } }`);
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    const config = JSON.parse(readFileSync(path, "utf8"));
+    expect(config.plugins.allow).toEqual(["other", "agentmemory"]);
+    expect(config.plugins.entries.other.enabled).toBe(true);
+    expect(config.skills.load.extraDirs).toEqual(["/custom-skills"]);
+    expect(config.agents.defaults.workspace).toBe("/custom");
+  });
+  it("keeps another memory slot selected until force is requested", async () => {
+    const raw = JSON.stringify({ plugins: { slots: { memory: "another-provider" } } });
+    writeFileSync(path, raw);
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("skipped");
+    expect(readFileSync(path, "utf8")).toBe(raw);
+    expect(existsSync(join(home, ".openclaw/extensions"))).toBe(false);
+    expect((await adapter.install({ dryRun: false, force: true })).kind).toBe("installed");
+    expect(JSON.parse(readFileSync(path, "utf8")).plugins.slots.memory).toBe("agentmemory");
+  });
+  it("preserves explicit conversation-access denial until force is requested", async () => {
+    const raw = JSON.stringify({ plugins: { entries: { agentmemory: { hooks: { allowConversationAccess: false } } } } });
+    writeFileSync(path, raw);
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("skipped");
+    expect(readFileSync(path, "utf8")).toBe(raw);
+    expect((await adapter.install({ dryRun: false, force: true })).kind).toBe("installed");
+  });
+  it("uses dynamic custom state and config paths without touching the original profile", async () => {
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    const state = join(home, "profile-state"); const custom = join(home, "config", "custom.json5");
+    vi.stubEnv("OPENCLAW_STATE_DIR", state); vi.stubEnv("OPENCLAW_CONFIG_PATH", custom);
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    expect(existsSync(custom)).toBe(true);
+    expect(existsSync(join(state, "extensions/agentmemory/plugin.mjs"))).toBe(true);
+    expect(existsSync(path)).toBe(false);
+  });
+  it("expands state and config tildes relative to the configured OpenClaw home", async () => {
+    const customHome = join(home, "custom-home");
+    vi.stubEnv("OPENCLAW_HOME", "~/custom-home");
+    vi.stubEnv("OPENCLAW_STATE_DIR", "~/state"); vi.stubEnv("OPENCLAW_CONFIG_PATH", "~/config/custom.json5");
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    expect(existsSync(join(customHome, "state/extensions/agentmemory/plugin.mjs"))).toBe(true);
+    expect(existsSync(join(customHome, "config/custom.json5"))).toBe(true);
+  });
+  it("uses a legacy state and config file when OpenClaw still resolves them", async () => {
+    rmSync(join(home, ".openclaw"), { recursive: true });
+    mkdirSync(join(home, ".clawdbot"));
+    const legacy = join(home, ".clawdbot/clawdbot.json");
+    writeFileSync(legacy, "{}");
+    const { adapter } = await import("../src/cli/connect/openclaw.js");
+    expect(adapter.detect()).toBe(true);
+    expect((await adapter.install({ dryRun: false, force: false })).kind).toBe("installed");
+    expect(JSON.parse(readFileSync(legacy, "utf8")).plugins.slots.memory).toBe("agentmemory");
+    expect(existsSync(join(home, ".openclaw"))).toBe(false);
   });
 
 });

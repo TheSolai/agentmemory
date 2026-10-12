@@ -1,6 +1,6 @@
 name: agentmemory
 version: 0.9.30
-description: "Persistent cross-session memory for OpenClaw via agentmemory. 95.2% retrieval accuracy on LongMemEval-S."
+description: "Persistent cross-session memory for OpenClaw via agentmemory."
 author: "Rohit Ghumare"
 homepage: "https://github.com/rohitg00/agentmemory"
 license: Apache-2.0

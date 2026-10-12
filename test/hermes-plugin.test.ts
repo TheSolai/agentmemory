@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const expectedHermesHooks = [
+  "on_turn_start",
   "prefetch",
   "sync_turn",
   "on_session_end",
