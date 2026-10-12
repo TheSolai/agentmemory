@@ -22,7 +22,7 @@ After wiring, restart the host or run its MCP reload (for example `/mcp` in Clau
 
 ## Notes
 
-- Skills install separately: `npx skills add rohitg00/agentmemory --agent hermes-agent --skill '*'` or use `--agent openclaw`. Choose the intended host; add `--global` only for a user-wide installation. Verify skill discovery and read a skill's local support file in that host.
+- Skills install separately: `npx skills@1.7.1 add rohitg00/agentmemory --agent hermes-agent --skill '*'` or use `--agent openclaw`. Choose the intended host; add `--global` only for a user-wide installation. Verify skill discovery and read a skill's local support file in that host.
 - Windows: use WSL2. Native Windows runs the server but `connect` is not supported there.
 
 ## See also

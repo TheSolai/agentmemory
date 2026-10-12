@@ -6,6 +6,7 @@ import { appendFileSync, chmodSync, closeSync, copyFileSync, cpSync, existsSync,
 import http from "node:http";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
+import { assertCommandCompleted, assertValidationRejected, killProcess as kill, runCommand } from "./command.mjs";
 
 const options = { hosts: [], node: process.execPath };
 for (let i = 2; i < process.argv.length; i++) {
@@ -34,22 +35,11 @@ const hash = (path) => createHash("sha256").update(readFileSync(path)).digest("h
 const hashes = Object.fromEntries([cli, join(pkg, "dist/standalone.mjs"), join(plugin, "plugin.mjs"), join(plugin, "openclaw.plugin.json")].map((path) => [path, hash(path)]));
 const baseEnv = (home) => ({ HOME: home, USERPROFILE: home, PATH: `${dirname(options.node)}:/usr/bin:/bin:/opt/homebrew/bin`, TMPDIR: join(root, "tmp"), NO_COLOR: "1", CI: "1" });
 mkdirSync(join(root, "tmp"), { recursive: true });
-function kill(pid) { try { process.kill(-pid, "SIGKILL"); } catch {} try { process.kill(pid, "SIGKILL"); } catch {} }
-function run(args, env, cwd, name, timeoutMs = 90_000) {
-  return new Promise((done) => {
-    const child = spawn(options.node, args, { env, cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    children.add(child.pid);
-    let output = "";
-    child.stdout.on("data", (data) => { output += data; });
-    child.stderr.on("data", (data) => { output += data; });
-    const timer = setTimeout(() => kill(child.pid), timeoutMs);
-    child.on("error", (error) => { output += error.message; });
-    child.on("close", (code) => {
-      clearTimeout(timer); children.delete(child.pid);
-      writeFileSync(join(root, `${name}.log`), output);
-      done({ code, output });
-    });
-  });
+async function run(args, env, cwd, name, timeoutMs = 90_000) {
+  const result = await runCommand(options.node, args, { env, cwd, children, timeoutMs });
+  writeFileSync(join(root, `${name}.log`), result.output);
+  assertCommandCompleted(result);
+  return result;
 }
 async function check(name, fn) {
   try { const detail = await fn(); receipts.push({ name, success: true, ...(detail || {}) }); console.log(`PASS ${name}`); }
@@ -227,7 +217,7 @@ try {
     });
     await check(`${label}: native validator rejects invalid limits`, async () => {
       config.plugins.entries.agentmemory.config.min_confidence = 1.1; saveConfig();
-      try { assert.notEqual((await run([nativeCli, "config", "validate", "--json"], env, home, `${label}-invalid-limits`)).code, 0); }
+      try { assertValidationRejected(await run([nativeCli, "config", "validate", "--json"], env, home, `${label}-invalid-limits`)); }
       finally { config.plugins.entries.agentmemory.config.min_confidence = 0; saveConfig(); }
     });
     await check(`${label}: denied conversation capture`, async () => {
