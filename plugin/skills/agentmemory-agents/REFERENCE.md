@@ -21,7 +21,7 @@ Generated from `src/cli/connect/index.ts`. Do not edit the block below by hand; 
 | Gemini CLI | `gemini-cli` | Using MCP (the only protocol Gemini CLI speaks). Memory bridge runs at :3111 underneath. |
 | Hermes Agent | `hermes` | Using MCP. Hooks are also available, see https://github.com/rohitg00/agentmemory/tree/main/integrations/hermes. |
 | Kiro | `kiro` | Using MCP via ~/.kiro/settings/mcp.json (user-level). Workspace overrides live in .kiro/settings/mcp.json. |
-| OpenClaw | `openclaw` | Using MCP. Hooks are also available, see https://github.com/rohitg00/agentmemory/tree/main/integrations/openclaw. |
+| OpenClaw | `openclaw` | Using MCP. Install the native plugin separately for automatic recall and capture. |
 | OpenCode | `opencode` | Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). For full auto-capture, also install the bundled plugin in plugin/opencode/. |
 | OpenHuman | `openhuman` | Using native hooks (REST API at :3111). MCP not required. |
 | pi | `pi` | Using native lifecycle hooks against the REST API at :3111 (recall on agent start, capture on agent end, memory tools). MCP not required. |

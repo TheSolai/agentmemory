@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { parseSearchExpansionIds } from "./search-arguments.js";
+import { parseSessionArguments } from "./session-arguments.js";
 import { isSearchLayer } from "../state/search-layer.js";
 import { checkAuth } from "../triggers/api.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -250,12 +251,21 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
-            const sessions = await kv.list(KV.sessions);
+            let query: Record<string, string>;
+            try { query = parseSessionArguments(args); }
+            catch (error) {
+              return { status_code: 400, body: { error: (error as Error).message } };
+            }
+            const result = await sdk.trigger({
+              function_id: "api::sessions",
+              payload: { headers: req.headers, query_params: query },
+            }) as McpResponse;
+            if (result.status_code !== 200) return result;
             return {
               status_code: 200,
               body: {
                 content: [
-                  { type: "text", text: JSON.stringify({ sessions }, null, 2) },
+                  { type: "text", text: JSON.stringify(result.body, null, 2) },
                 ],
               },
             };

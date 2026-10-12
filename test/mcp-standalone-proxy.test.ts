@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { handleToolCall } from "../src/mcp/standalone.js";
+import { handleToolCall, handleToolsList } from "../src/mcp/standalone.js";
 import { resetHandleForTests } from "../src/mcp/rest-proxy.js";
 import { InMemoryKV } from "../src/mcp/in-memory-kv.js";
 
@@ -51,6 +51,18 @@ describe("@agentmemory/mcp standalone — server proxy", () => {
     expect(body.sessions).toHaveLength(1);
     expect(body.sessions[0].id).toBe("sess-1");
     expect(calls.find((c) => c.url.includes("/sessions"))).toBeDefined();
+  });
+
+  it("preserves session scope and continuation through URL encoding", async () => {
+    const cursor = Buffer.from(JSON.stringify({ key: "2026-01-02", id: "session-2" })).toString("base64url");
+    let requested: URL | undefined;
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      requested = new URL(url);
+      return new Response(JSON.stringify({ sessions: [], nextCursor: null }), { status: 200 });
+    });
+    await handleToolCall("memory_sessions", { project: "repo & branch/#1", agentId: "agent/b", cursor, limit: 2 });
+    expect(Object.fromEntries(requested!.searchParams)).toEqual({ project: "repo & branch/#1", agentId: "agent/b", cursor, limit: "2" });
   });
 
   it("proxies memory_smart_search to POST /agentmemory/smart-search", async () => {
@@ -196,6 +208,35 @@ describe("@agentmemory/mcp standalone — server proxy", () => {
     await handleToolCall("memory_sessions", {});
     expect(authByPath.get("/agentmemory/livez")).toBe("Bearer s3cret");
     expect(authByPath.get("/agentmemory/sessions")).toBe("Bearer s3cret");
+  });
+
+  it.each([401, 403])("propagates HTTP %i for every tool without reading or mutating local fallback", async (status) => {
+    installFetch((url) => url.endsWith("/agentmemory/livez")
+      ? new Response("ok")
+      : new Response(JSON.stringify({ error: "Authentication rejected", oversized: true }), { status }));
+    const localKv = new InMemoryKV(undefined);
+    const localMemory = { id: "mem_local", content: "local-only fixture", title: "local-only fixture", sessionIds: [] };
+    await localKv.set("mem:memories", localMemory.id, localMemory);
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["memory_save", { content: "must not save locally" }],
+      ["memory_recall", { query: "local-only" }],
+      ["memory_smart_search", { query: "local-only" }],
+      ["memory_sessions", {}],
+      ["memory_export", {}],
+      ["memory_audit", {}],
+      ["memory_governance_delete", { memoryIds: localMemory.id }],
+      ["memory_lesson_save", { title: "must not save", content: "fixture" }],
+    ];
+    for (const [name, args] of cases) {
+      await expect(handleToolCall(name, args, localKv), name).rejects.toMatchObject({ status });
+      expect(await localKv.list("mem:memories")).toEqual([localMemory]);
+    }
+  });
+
+  it.each([401, 403])("does not replace a rejected tool inventory with a successful fallback on HTTP %i", async (status) => {
+    installFetch((url) => url.endsWith("/agentmemory/livez")
+      ? new Response("ok") : new Response("Unauthorized", { status }));
+    await expect(handleToolsList()).rejects.toMatchObject({ status });
   });
 
   it("falls back to local InMemoryKV when server is unreachable", async () => {
@@ -355,6 +396,25 @@ describe("@agentmemory/mcp standalone — server proxy", () => {
     } finally {
       delete process.env["AGENTMEMORY_FORCE_PROXY"];
     }
+  });
+
+  it.each(["1", "true"])("forced proxy mode %s preserves request failures instead of switching stores", async (value) => {
+    process.env.AGENTMEMORY_FORCE_PROXY = value;
+    const localKv = new InMemoryKV(undefined);
+    try {
+      for (const failure of ["network", "http", "json"]) {
+        installFetch(() => {
+          if (failure === "network") throw new Error("synthetic connection refused");
+          return failure === "http" ? new Response("unavailable", { status: 500 }) : new Response("malformed-json");
+        });
+        await expect(handleToolCall("memory_save", { content: "must not save locally" }, localKv)).rejects.toThrow();
+        await expect(handleToolCall("memory_recall", { query: "fixture" }, localKv)).rejects.toThrow();
+        await expect(handleToolsList()).rejects.toThrow();
+        expect(await localKv.list("mem:memories")).toEqual([]);
+      }
+      installFetch(() => new Response('{"unexpected":true}'));
+      await expect(handleToolsList()).rejects.toThrow(/inventory/i);
+    } finally { delete process.env.AGENTMEMORY_FORCE_PROXY; }
   });
 
   it("logs probe failure to stderr so sandboxed clients can diagnose silently dropped tools", async () => {

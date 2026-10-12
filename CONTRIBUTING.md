@@ -107,6 +107,8 @@ It builds, packs `@agentmemory/agentmemory` and `@agentmemory/mcp`, installs bot
 
 For startup changes, also run `npm run test:startup:packaged`. It installs the packed CLI in isolated homes and tests delayed workers, existing-engine adoption, `--no-engine`, doctor, demo, timeout failures and process cleanup. The default slow-worker case waits 48 seconds before importing the installed worker. Pass `--tarball <file.tgz>` to test an existing artifact. Run the standard release gate first to cache the pinned engine, or set `AGENTMEMORY_GATE_ENGINE` to that engine binary. Docker scenarios require a working Docker daemon; the report records unavailable Docker coverage explicitly.
 
+For Hermes, OpenClaw or shared skill changes, follow [Native integration tests](docs/native-integration-tests.md). Those gates load plugins and skills from an installed tarball and inspect the native model requests and backend records. Source tests alone do not establish native lifecycle capture or skill discovery.
+
 Then: CHANGELOG section, PR, merge, tag, GitHub release. The `Publish to npm` workflow picks up the release trigger and publishes `@agentmemory/agentmemory`, `@agentmemory/mcp`, and `@agentmemory/fs-watcher` to npm with provenance (`@agentmemory/fs-watcher` versions independently from `integrations/filesystem-watcher/package.json`).
 
 ## Security issues

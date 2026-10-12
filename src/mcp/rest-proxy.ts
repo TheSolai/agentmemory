@@ -11,7 +11,7 @@ function probeTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
 }
 
-function forceProxy(): boolean {
+export function isProxyRequired(): boolean {
   const raw = process.env["AGENTMEMORY_FORCE_PROXY"];
   return raw === "1" || raw === "true";
 }
@@ -41,6 +41,7 @@ export interface LocalHandle {
 export type Handle = ProxyHandle | LocalHandle;
 
 let cached: Handle | null = null;
+let cachedUrl: string | null = null;
 let cachedAt = 0;
 let probeInFlight: Promise<Handle> | null = null;
 
@@ -59,11 +60,21 @@ export function resolveEnvOrEmpty(name: string): string {
 }
 
 function baseUrl(): string {
-  return (resolveEnvOrEmpty("AGENTMEMORY_URL") || DEFAULT_URL).replace(/\/+$/, "");
+  const value = resolveEnvOrEmpty("AGENTMEMORY_URL") || DEFAULT_URL;
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname ||
+        parsed.username || parsed.password || parsed.search || parsed.hash || /\s/.test(value)) {
+      throw new Error();
+    }
+    return value.replace(/\/+$/, "");
+  } catch {
+    throw new Error("AGENTMEMORY_URL must be an HTTP(S) URL without credentials, query, or fragment");
+  }
 }
 
-function authHeader(): Record<string, string> {
-  const secret = resolveClientSecret(baseUrl());
+function authHeader(url: string): Record<string, string> {
+  const secret = resolveClientSecret(url);
   return secret ? { authorization: `Bearer ${secret}` } : {};
 }
 
@@ -78,6 +89,7 @@ const defaultLivezProbe: LivezProbe = async (url, timeoutMs, headers) => {
     method: "GET",
     headers,
     signal: AbortSignal.timeout(timeoutMs),
+    redirect: "error",
   });
   return { ok: res.ok, status: res.status, statusText: res.statusText };
 };
@@ -97,7 +109,7 @@ export function setLivezProbe(fn?: LivezProbe): void {
 async function probe(url: string): Promise<boolean> {
   const timeout = probeTimeoutMs();
   try {
-    const res = await livezProbe(url, timeout, authHeader());
+    const res = await livezProbe(url, timeout, authHeader(url));
     if (!res.ok) {
       process.stderr.write(
         `[@agentmemory/mcp] livez probe ${url}/agentmemory/livez -> ${res.status ?? "?"} ${res.statusText ?? ""}; falling back to local InMemoryKV (set AGENTMEMORY_FORCE_PROXY=1 to skip the probe)\n`,
@@ -114,11 +126,14 @@ async function probe(url: string): Promise<boolean> {
 
 export function invalidateHandle(): void {
   cached = null;
+  cachedUrl = null;
   cachedAt = 0;
 }
 
 export async function resolveHandle(): Promise<Handle> {
   const now = Date.now();
+  const url = baseUrl();
+  if (cached && (cachedUrl !== url || (cached.mode === "local" && isProxyRequired()))) invalidateHandle();
   if (cached) {
     if (cached.mode === "local" && now - cachedAt >= LOCAL_MODE_TTL_MS) {
       cached = null;
@@ -128,8 +143,7 @@ export async function resolveHandle(): Promise<Handle> {
     }
   }
   if (probeInFlight) return probeInFlight;
-  const url = baseUrl();
-  const skipProbe = forceProxy();
+  const skipProbe = isProxyRequired();
   probeInFlight = (async () => {
     const up = skipProbe ? true : await probe(url);
     if (skipProbe) {
@@ -142,14 +156,18 @@ export async function resolveHandle(): Promise<Handle> {
         mode: "proxy",
         baseUrl: url,
         call: async (path, init) => {
+          if (baseUrl() !== url) {
+            throw new Error("AgentMemory endpoint changed; resolve a new proxy handle before retrying.");
+          }
           const res = await fetch(`${url}${path}`, {
             ...init,
             headers: {
               "content-type": "application/json",
-              ...authHeader(),
+              ...authHeader(url),
               ...(init?.headers as Record<string, string> | undefined),
             },
             signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+            redirect: "error",
           });
           if (!res.ok) {
             const errText = await res.text().catch(() => "");
@@ -172,11 +190,13 @@ export async function resolveHandle(): Promise<Handle> {
         },
       };
       cached = handle;
+      cachedUrl = url;
       cachedAt = Date.now();
       return handle;
     }
     const local: LocalHandle = { mode: "local" };
     cached = local;
+    cachedUrl = url;
     cachedAt = Date.now();
     return local;
   })();
@@ -189,6 +209,7 @@ export async function resolveHandle(): Promise<Handle> {
 
 export function resetHandleForTests(): void {
   cached = null;
+  cachedUrl = null;
   cachedAt = 0;
   probeInFlight = null;
   livezProbe = defaultLivezProbe;

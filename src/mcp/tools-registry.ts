@@ -134,8 +134,16 @@ export const CORE_TOOLS: McpToolDef[] = [
   {
     name: "memory_sessions",
     description:
-      "List recent sessions with their status and observation counts.",
-    inputSchema: { type: "object", properties: {} },
+      "List recent sessions with status, observation counts, summaries and a continuation cursor. Filters apply before pagination; retain them when requesting the next page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Exact project identifier used when sessions were started" },
+        agentId: { type: "string", description: "Filter by owning agent; '*' reads across agents" },
+        limit: { type: "integer", description: "Page size (default 20, max 100)" },
+        cursor: { type: "string", description: "nextCursor from the previous page; omit for the first page" },
+      },
+    },
   },
   {
     name: "memory_smart_search",
